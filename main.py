@@ -1,106 +1,164 @@
 import cv2
-import time
 import dlib
 import numpy as np
+from scipy.spatial import distance as dist
 from imutils import face_utils
-from camera import Camera
-from npu_inferencer import NPUInferencer
-from utils import apply_clahe, draw_info
-import config
+import time
+import os
 
-# --- Drowsiness Logic Variables ---
-DROWSY_CONSEC_FRAMES = 15
-drowsy_counter = 0
-current_status = "Active"
+# --- SETTINGS (Adjust these to tune sensitivity) ---
+
+# Path to the dlib facial landmark predictor model
+DLIB_LANDMARK_MODEL = "shape_predictor_68_face_landmarks.dat"
+
+# Use 0 for a local webcam or provide the path/URL to a video file
+CAMERA_SOURCE = 0
+
+# Number of frames to use for the initial calibration
+CALIBRATION_FRAMES = 60
+
+# --- DROWSINESS THRESHOLDS ---
+
+# 1. Eye Closure Settings
+# Percentage of the calibrated "open" eye aspect ratio to count as "closed"
+EAR_PERCENTAGE_THRESHOLD = 0.85
+# How many seconds of continuous eye closure triggers a time-based alert
+EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
+# How many consecutive frames of eye closure triggers a frame-based alert
+DROWSY_CONSEC_FRAMES = 25
+
+# 2. Yawn Settings
+# Mouth Aspect Ratio threshold to detect a yawn
+YAWN_MAR_THRESHOLD = 0.9
 
 
-# --- End of Drowsiness Logic ---
+# --- END OF SETTINGS ---
 
-def main():
-    global drowsy_counter, current_status
 
-    # Initialize components
-    camera = Camera(config.CAMERA_URL)
-    npu_inferencer = NPUInferencer()
+def eye_aspect_ratio(eye):
+    """Computes the Eye Aspect Ratio (EAR) for a single eye."""
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
+    C = dist.euclidean(eye[0], eye[3])
+    ear = (A + B) / (2.0 * C)
+    return ear
 
-    # --- Dlib and OpenCV Initializations ---
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcade_frontalface_default.xml')
-    # Load the Dlib facial landmark predictor
-    try:
-        predictor = dlib.shape_predictor(config.DLIB_LANDMARK_MODEL)
-    except Exception as e:
-        print(f"[ERROR] Could not load Dlib predictor model: {e}")
-        print(f"Make sure '{config.DLIB_LANDMARK_MODEL}' is in the project directory.")
-        return
-    # --- End of Initializations ---
 
-    last_emotion = "Unknown"
+def mouth_aspect_ratio(mouth):
+    """Computes the Mouth Aspect Ratio (MAR)."""
+    A = dist.euclidean(mouth[2], mouth[10])  # Vertical distance
+    B = dist.euclidean(mouth[4], mouth[8])  # Vertical distance
+    C = dist.euclidean(mouth[0], mouth[6])  # Horizontal distance
+    mar = (A + B) / (2.0 * C)
+    return mar
 
-    if not camera.start():
-        return
 
-    try:
-        while True:
-            frame = camera.get_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
+# --- STATE VARIABLES ---
+is_calibrated = False
+calibration_ear_values = []
+calibrated_ear_threshold = 0.0
+eye_closure_start_time = None  # For time-based check
+drowsy_counter = 0  # For frame-based check
+# --- END STATE VARIABLES ---
 
-            frame = cv2.resize(frame, (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+# Check if the model file exists
+if not os.path.exists(DLIB_LANDMARK_MODEL):
+    print(f"[ERROR] Dlib model not found at '{DLIB_LANDMARK_MODEL}'")
+    exit()
 
-            # 1. Fast Face Detection (Haar Cascade)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+print("[INFO] Loading facial landmark predictor...")
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(DLIB_LANDMARK_MODEL)
 
-            # Process only the first detected face for simplicity
-            if len(faces) > 0:
-                x, y, w, h = faces[0]
+# Get landmark indexes from imutils
+(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+(mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
 
-                # Create a dlib rectangle object from the Haar cascade's bounding box
-                dlib_rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
+print("[INFO] Starting video stream...")
+vs = cv2.VideoCapture(CAMERA_SOURCE)
+time.sleep(1.0)
 
-                # 2. Precise Landmark Prediction (Dlib)
-                shape = predictor(gray, dlib_rect)
-                shape_np = face_utils.shape_to_np(shape)
+while True:
+    ret, frame = vs.read()
+    if not ret:
+        break
 
-                # 3. Align & Crop the face using landmarks
-                # Find the bounding box of the landmarks to get a tight crop
-                (lx, ly, lw, lh) = cv2.boundingRect(shape_np)
-                # Add some padding
-                padding = 10
-                aligned_face = frame[max(0, ly - padding):ly + lh + padding, max(0, lx - padding):lx + lw + padding]
+    frame = cv2.resize(frame, (800, 600))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    rects = detector(gray, 0)
+    status_text = "Active"
+    alert_triggered = False
 
-                # 4. TFLite Classification
-                if aligned_face.size > 0:
-                    last_emotion = npu_inferencer.infer(aligned_face)
+    if len(rects) > 0:
+        shape = predictor(gray, rects[0])
+        shape = face_utils.shape_to_np(shape)
 
-                # --- Drowsiness Logic Integration ---
-                mapped_emotion = config.EMOTION_MAPPING.get(last_emotion, 'attention')
-                if mapped_emotion == 'drowsy':
-                    drowsy_counter += 1
-                    if drowsy_counter >= DROWSY_CONSEC_FRAMES:
-                        current_status = "DROWSINESS ALERT!"
+        leftEye = shape[lStart:lEnd]
+        rightEye = shape[rStart:rEnd]
+        mouth = shape[mStart:mEnd]
+
+        ear = (eye_aspect_ratio(leftEye) + eye_aspect_ratio(rightEye)) / 2.0
+        mar = mouth_aspect_ratio(mouth)
+
+        # Draw contours for visualization
+        cv2.drawContours(frame, [cv2.convexHull(leftEye)], -1, (0, 255, 0), 1)
+        cv2.drawContours(frame, [cv2.convexHull(rightEye)], -1, (0, 255, 0), 1)
+        cv2.drawContours(frame, [cv2.convexHull(mouth)], -1, (0, 255, 0), 1)
+
+        if not is_calibrated:
+            status_text = "Calibrating..."
+            calibration_ear_values.append(ear)
+            if len(calibration_ear_values) >= CALIBRATION_FRAMES:
+                # Use median for a more robust calibration against blinks
+                median_ear = np.median(calibration_ear_values)
+                calibrated_ear_threshold = median_ear * EAR_PERCENTAGE_THRESHOLD
+                is_calibrated = True
+                print(f"[INFO] Calibration complete. EAR Threshold set to: {calibrated_ear_threshold:.2f}")
+        else:
+            is_eyes_closed = ear < calibrated_ear_threshold
+
+            # --- DROWSINESS DETECTION LOGIC ---
+
+            # 1. Check for a yawn
+            if mar > YAWN_MAR_THRESHOLD:
+                alert_triggered = True
+
+            # 2. Check for sustained eye closure (both time and frame based)
+            elif is_eyes_closed:
+                # Time-based check
+                if eye_closure_start_time is None:
+                    eye_closure_start_time = time.time()  # Start the timer
                 else:
-                    drowsy_counter = 0
-                    current_status = "Active"
-                # --- End of Logic Integration ---
+                    elapsed_time = time.time() - eye_closure_start_time
+                    if elapsed_time >= EYE_CLOSURE_SECONDS_THRESHOLD:
+                        alert_triggered = True
 
-                # Visualization: Draw landmarks and status
-                for (sx, sy) in shape_np:
-                    cv2.circle(frame, (sx, sy), 2, (0, 255, 0), -1)
+                # Frame-based check
+                drowsy_counter += 1
+                if drowsy_counter >= DROWSY_CONSEC_FRAMES:
+                    alert_triggered = True
+            else:
+                # Reset timers and counters if eyes are open
+                eye_closure_start_time = None
+                drowsy_counter = 0
 
-                color = (0, 0, 255) if "ALERT" in current_status else (0, 255, 0)
-                draw_info(frame, [x, y, w, h], current_status, color)
+            if alert_triggered:
+                status_text = "DROWSINESS ALERT!"
+    else:
+        status_text = "No Face Detected"
+        # Reset timers and counters if face is lost
+        eye_closure_start_time = None
+        drowsy_counter = 0
 
-            cv2.imshow("Conductor Monitor", frame)
+    # Draw the status text
+    color = (0, 0, 255) if alert_triggered else (0, 255, 0)
+    cv2.putText(frame, f"Status: {status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+    cv2.imshow("Drowsiness Detector", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        break
 
-    finally:
-        camera.stop()
-        cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+cv2.destroyAllWindows()
+vs.release()
