@@ -18,18 +18,17 @@ CAMERA_SOURCE = 0
 CALIBRATION_FRAMES = 60
 
 # --- DROWSINESS THRESHOLDS ---
-
-# 1. Eye Closure Settings
-# Percentage of the calibrated "open" eye aspect ratio to count as "closed"
 EAR_PERCENTAGE_THRESHOLD = 0.85
-# How many seconds of continuous eye closure triggers a time-based alert
+# 1. Time-based alert for long eye closures
 EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
-# How many consecutive frames of eye closure triggers a frame-based alert
-DROWSY_CONSEC_FRAMES = 25
-
-# 2. Yawn Settings
-# Mouth Aspect Ratio threshold to detect a yawn
+# 2. Frame-based alert for shorter, consecutive eye closures
+DROWSY_CONSEC_FRAMES = 25  # <<< ADDED BACK
+# 3. Yawn-based alert
 YAWN_MAR_THRESHOLD = 0.9
+
+# --- SMILE DETECTION THRESHOLD ---
+# Ratio of mouth width to eye distance. Higher means a wider smile.
+SMILE_THRESHOLD = 0.7
 
 
 # --- END OF SETTINGS ---
@@ -46,9 +45,9 @@ def eye_aspect_ratio(eye):
 
 def mouth_aspect_ratio(mouth):
     """Computes the Mouth Aspect Ratio (MAR)."""
-    A = dist.euclidean(mouth[2], mouth[10])  # Vertical distance
-    B = dist.euclidean(mouth[4], mouth[8])  # Vertical distance
-    C = dist.euclidean(mouth[0], mouth[6])  # Horizontal distance
+    A = dist.euclidean(mouth[2], mouth[10])  # Vertical
+    B = dist.euclidean(mouth[4], mouth[8])  # Vertical
+    C = dist.euclidean(mouth[0], mouth[6])  # Horizontal
     mar = (A + B) / (2.0 * C)
     return mar
 
@@ -70,7 +69,7 @@ print("[INFO] Loading facial landmark predictor...")
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor(DLIB_LANDMARK_MODEL)
 
-# Get landmark indexes from imutils
+# Get landmark indexes
 (lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
 (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
 (mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
@@ -101,6 +100,12 @@ while True:
         ear = (eye_aspect_ratio(leftEye) + eye_aspect_ratio(rightEye)) / 2.0
         mar = mouth_aspect_ratio(mouth)
 
+        # Smile Detection
+        smile_width = dist.euclidean(shape[48], shape[54])  # Mouth corners
+        eye_distance = dist.euclidean(shape[36], shape[45])  # Eye corners
+        smile_ratio = smile_width / eye_distance
+        is_smiling = smile_ratio > SMILE_THRESHOLD
+
         # Draw contours for visualization
         cv2.drawContours(frame, [cv2.convexHull(leftEye)], -1, (0, 255, 0), 1)
         cv2.drawContours(frame, [cv2.convexHull(rightEye)], -1, (0, 255, 0), 1)
@@ -110,7 +115,6 @@ while True:
             status_text = "Calibrating..."
             calibration_ear_values.append(ear)
             if len(calibration_ear_values) >= CALIBRATION_FRAMES:
-                # Use median for a more robust calibration against blinks
                 median_ear = np.median(calibration_ear_values)
                 calibrated_ear_threshold = median_ear * EAR_PERCENTAGE_THRESHOLD
                 is_calibrated = True
@@ -118,36 +122,35 @@ while True:
         else:
             is_eyes_closed = ear < calibrated_ear_threshold
 
-            # --- DROWSINESS DETECTION LOGIC ---
-
-            # 1. Check for a yawn
+            # --- COMBINED DROWSINESS LOGIC ---
             if mar > YAWN_MAR_THRESHOLD:
                 alert_triggered = True
-
-            # 2. Check for sustained eye closure (both time and frame based)
-            elif is_eyes_closed:
-                # Time-based check
+            elif is_eyes_closed and not is_smiling:
+                # 1. Time-based check
                 if eye_closure_start_time is None:
-                    eye_closure_start_time = time.time()  # Start the timer
+                    eye_closure_start_time = time.time()
                 else:
                     elapsed_time = time.time() - eye_closure_start_time
                     if elapsed_time >= EYE_CLOSURE_SECONDS_THRESHOLD:
                         alert_triggered = True
 
-                # Frame-based check
+                # 2. Frame-based check
                 drowsy_counter += 1
                 if drowsy_counter >= DROWSY_CONSEC_FRAMES:
                     alert_triggered = True
             else:
-                # Reset timers and counters if eyes are open
+                # Reset if eyes are open or smiling
                 eye_closure_start_time = None
                 drowsy_counter = 0
 
             if alert_triggered:
                 status_text = "DROWSINESS ALERT!"
+            elif is_smiling:
+                status_text = "Active (Smiling)"
+
     else:
         status_text = "No Face Detected"
-        # Reset timers and counters if face is lost
+        # Reset all counters if face is lost
         eye_closure_start_time = None
         drowsy_counter = 0
 
