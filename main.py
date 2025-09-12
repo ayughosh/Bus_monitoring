@@ -22,13 +22,17 @@ EAR_PERCENTAGE_THRESHOLD = 0.85
 # 1. Time-based alert for long eye closures
 EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
 # 2. Frame-based alert for shorter, consecutive eye closures
-DROWSY_CONSEC_FRAMES = 25  # <<< ADDED BACK
-# 3. Yawn-based alert
+DROWSY_CONSEC_FRAMES = 25
+
+# --- YAWN DETECTION THRESHOLDS (NOW WITH DURATION) ---
+# Mouth Aspect Ratio threshold to be considered "open wide"
 YAWN_MAR_THRESHOLD = 0.9
+# How many seconds the mouth must be "open wide" to be confirmed as a yawn
+YAWN_DURATION_SECONDS = 2.5  # <<< NEW SETTING
 
 # --- SMILE DETECTION THRESHOLD ---
 # Ratio of mouth width to eye distance. Higher means a wider smile.
-SMILE_THRESHOLD = 0.7
+SMILE_THRESHOLD = 0.70
 
 
 # --- END OF SETTINGS ---
@@ -58,6 +62,7 @@ calibration_ear_values = []
 calibrated_ear_threshold = 0.0
 eye_closure_start_time = None  # For time-based check
 drowsy_counter = 0  # For frame-based check
+yawn_start_time = None  # For yawn timer check
 # --- END STATE VARIABLES ---
 
 # Check if the model file exists
@@ -101,8 +106,8 @@ while True:
         mar = mouth_aspect_ratio(mouth)
 
         # Smile Detection
-        smile_width = dist.euclidean(shape[48], shape[54])  # Mouth corners
-        eye_distance = dist.euclidean(shape[36], shape[45])  # Eye corners
+        smile_width = dist.euclidean(shape[48], shape[54])
+        eye_distance = dist.euclidean(shape[36], shape[45])
         smile_ratio = smile_width / eye_distance
         is_smiling = smile_ratio > SMILE_THRESHOLD
 
@@ -121,12 +126,24 @@ while True:
                 print(f"[INFO] Calibration complete. EAR Threshold set to: {calibrated_ear_threshold:.2f}")
         else:
             is_eyes_closed = ear < calibrated_ear_threshold
+            is_mouth_open_wide = mar > YAWN_MAR_THRESHOLD
 
             # --- COMBINED DROWSINESS LOGIC ---
-            if mar > YAWN_MAR_THRESHOLD:
-                alert_triggered = True
-            elif is_eyes_closed and not is_smiling:
-                # 1. Time-based check
+
+            # 1. Check for a sustained yawn
+            if is_mouth_open_wide and not is_smiling:
+                if yawn_start_time is None:
+                    yawn_start_time = time.time()
+                else:
+                    elapsed_time = time.time() - yawn_start_time
+                    if elapsed_time >= YAWN_DURATION_SECONDS:
+                        alert_triggered = True
+            else:
+                yawn_start_time = None
+
+            # 2. Check for eye closure if not yawning
+            if not alert_triggered and is_eyes_closed and not is_smiling:
+                # Time-based check
                 if eye_closure_start_time is None:
                     eye_closure_start_time = time.time()
                 else:
@@ -134,12 +151,12 @@ while True:
                     if elapsed_time >= EYE_CLOSURE_SECONDS_THRESHOLD:
                         alert_triggered = True
 
-                # 2. Frame-based check
+                # Frame-based check
                 drowsy_counter += 1
                 if drowsy_counter >= DROWSY_CONSEC_FRAMES:
                     alert_triggered = True
             else:
-                # Reset if eyes are open or smiling
+                # Reset eye counters if eyes are open or smiling
                 eye_closure_start_time = None
                 drowsy_counter = 0
 
@@ -153,6 +170,7 @@ while True:
         # Reset all counters if face is lost
         eye_closure_start_time = None
         drowsy_counter = 0
+        yawn_start_time = None
 
     # Draw the status text
     color = (0, 0, 255) if alert_triggered else (0, 255, 0)
