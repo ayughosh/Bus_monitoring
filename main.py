@@ -6,13 +6,14 @@ from imutils import face_utils
 import time
 import os
 
+
 class DrowsinessDetector:
     def __init__(self):
-        # --- SETTINGS ---
+        # --- SETTINGS (All settings are now class attributes) ---
         self.CAMERA_SOURCE = 0
         self.DLIB_LANDMARK_MODEL = "shape_predictor_68_face_landmarks.dat"
-        self.RECALIBRATION_FRAMES = 20
-        self.RECALIBRATION_INTERVAL_SECONDS = 60
+
+        # --- THRESHOLDS ---
         self.EAR_PERCENTAGE_THRESHOLD = 0.85
         self.EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
         self.DROWSY_CONSEC_FRAMES = 25
@@ -20,14 +21,39 @@ class DrowsinessDetector:
         self.YAWN_DURATION_SECONDS = 2.0
         self.SMILE_THRESHOLD = 0.8
 
-        # --- STATE VARIABLES ---
+        # --- RECALIBRATION SETTINGS ---
+        self.RECALIBRATION_FRAMES = 20
+        self.RECALIBRATION_INTERVAL_SECONDS = 60
+        self.FACE_TRACKING_TOLERANCE_PIXELS = 75
+        self.RECALIBRATION_CANDIDATE_SECONDS = 3.0
+
+        # --- NEW SETTINGS FOR ON-SCREEN DISPLAY ---
+        self.FATIGUE_BLINK_RATE_SECONDS = 30  # Reduced to 30 seconds
+        self.BLINK_CONSEC_FRAMES = 3
+        self.HEAD_NOD_FRAME_WINDOW = 20
+        self.HEAD_NOD_THRESHOLD_PIXELS = 18
+
+        # --- ALL COUNTERS AND STATE VARIABLES DEFINED HERE ---
         self.calibrated_ear_threshold = None
-        self.is_calibrating = True
+        self.is_calibrating = False
         self.calibration_ear_values = []
         self.last_recalibration_time = None
         self.eye_closure_start_time = None
         self.drowsy_counter = 0
         self.yawn_start_time = None
+        self.candidate_face_center = None
+        self.candidate_start_time = None
+        self.calibrated_face_centers = []
+        # New variables for display
+        self.yawn_count = 0
+        self.nod_count = 0
+        self.blink_counter = 0
+        self.blink_frame_counter = 0
+        self.display_blink_rate = 0
+        self.blink_analysis_start_time = time.time()
+        self.head_positions = []
+        self.is_yawning = False
+        self.is_nodding = False
 
         # --- DLIB INITIALIZATION ---
         if not os.path.exists(self.DLIB_LANDMARK_MODEL):
@@ -37,10 +63,10 @@ class DrowsinessDetector:
         self.detector = dlib.get_frontal_face_detector()
         self.predictor = dlib.shape_predictor(self.DLIB_LANDMARK_MODEL)
 
-        # Get landmark indexes
-        self.lStart, self.lEnd = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
-        self.rStart, self.rEnd = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
-        self.mStart, self.mEnd = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+        (self.lStart, self.lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+        (self.rStart, self.rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+        (self.mStart, self.mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+        (self.nStart, self.nEnd) = face_utils.FACIAL_LANDMARKS_IDXS["nose"]
 
     def eye_aspect_ratio(self, eye):
         A = dist.euclidean(eye[1], eye[5])
@@ -54,63 +80,133 @@ class DrowsinessDetector:
         C = dist.euclidean(mouth[0], mouth[6])
         return (A + B) / (2.0 * C)
 
-    def process_frame(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        rects = self.detector(gray, 0)
+    def recalibrate(self, vs):
+        print(f"\n[{time.ctime()}] Starting recalibration...")
+        self.is_calibrating = True
+        self.calibration_ear_values = []
 
-        status_text = "Active"
-        alert_triggered = False
+        for i in range(self.RECALIBRATION_FRAMES):
+            ret, frame = vs.read()
+            if not ret: continue
 
-        if len(rects) > 0:
-            largest_rect = max(rects, key=lambda rect: rect.width() * rect.height())
-            shape = self.predictor(gray, largest_rect)
-            shape = face_utils.shape_to_np(shape)
+            frame = cv2.resize(frame, (800, 600))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rects = self.detector(gray, 0)
 
-            leftEye = shape[self.lStart:self.lEnd]
-            rightEye = shape[self.rStart:self.rEnd]
-            mouth = shape[self.mStart:self.mEnd]
+            cv2.putText(frame, "RECALIBRATING...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-            ear = (self.eye_aspect_ratio(leftEye) + self.eye_aspect_ratio(rightEye)) / 2.0
-            mar = self.mouth_aspect_ratio(mouth)
-
-            # Draw contours for visualization
-            cv2.drawContours(frame, [cv2.convexHull(leftEye)], -1, (0, 255, 0), 1)
-            cv2.drawContours(frame, [cv2.convexHull(rightEye)], -1, (0, 255, 0), 1)
-            cv2.drawContours(frame, [cv2.convexHull(mouth)], -1, (0, 255, 0), 1)
-
-            if self.is_calibrating:
-                status_text = "RECALIBRATING..."
+            if len(rects) > 0:
+                shape = self.predictor(gray, rects[0])
+                shape = face_utils.shape_to_np(shape)
+                leftEye = shape[self.lStart:self.lEnd]
+                rightEye = shape[self.rStart:self.rEnd]
+                ear = (self.eye_aspect_ratio(leftEye) + self.eye_aspect_ratio(rightEye)) / 2.0
                 self.calibration_ear_values.append(ear)
-                if len(self.calibration_ear_values) >= self.RECALIBRATION_FRAMES:
-                    median_ear = np.median(self.calibration_ear_values)
-                    self.calibrated_ear_threshold = median_ear * self.EAR_PERCENTAGE_THRESHOLD
-                    self.is_calibrating = False
-                    self.calibration_ear_values = []  # Reset for next time
-                    print(
-                        f"[{time.ctime()}] Recalibration complete. New EAR Threshold: {self.calibrated_ear_threshold:.2f}")
-            else:
-                smile_width = dist.euclidean(shape[48], shape[54])
-                eye_distance = dist.euclidean(shape[36], shape[45])
-                smile_ratio = smile_width / eye_distance
-                is_smiling = smile_ratio > self.SMILE_THRESHOLD
 
+            cv2.imshow("Drowsiness Detector", frame)
+            cv2.waitKey(1)
+
+        if self.calibration_ear_values:
+            median_ear = np.median(self.calibration_ear_values)
+            self.calibrated_ear_threshold = median_ear * self.EAR_PERCENTAGE_THRESHOLD
+            print(f"[{time.ctime()}] Recalibration complete. New EAR Threshold: {self.calibrated_ear_threshold:.2f}\n")
+        else:
+            print("[WARNING] Recalibration failed: No face detected.")
+
+        self.is_calibrating = False
+        self.last_recalibration_time = time.time()
+        self.reset_counters()
+
+    def reset_counters(self):
+        self.eye_closure_start_time = None
+        self.drowsy_counter = 0
+        self.yawn_start_time = None
+
+    def run(self):
+        print("[INFO] Starting video stream...")
+        vs = cv2.VideoCapture(self.CAMERA_SOURCE)
+        time.sleep(1.0)
+
+        self.recalibrate(vs)
+
+        while True:
+            if time.time() - self.last_recalibration_time > self.RECALIBRATION_INTERVAL_SECONDS:
+                self.recalibrate(vs)
+
+            ret, frame = vs.read()
+            if not ret: break
+
+            frame = cv2.resize(frame, (800, 600))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rects = self.detector(gray, 0)
+
+            status_text = "Active"
+            alert_triggered = False
+
+            if len(rects) > 0:
+                largest_rect = max(rects, key=lambda rect: rect.width() * rect.height())
+
+                # Draw face bounding box
+                (x, y, w, h) = (largest_rect.left(), largest_rect.top(), largest_rect.width(), largest_rect.height())
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+
+                shape = self.predictor(gray, largest_rect)
+                shape = face_utils.shape_to_np(shape)
+
+                leftEye, rightEye, mouth, nose = shape[self.lStart:self.lEnd], shape[self.rStart:self.rEnd], shape[
+                    self.mStart:self.mEnd], shape[self.nStart:self.nEnd]
+                ear = (self.eye_aspect_ratio(leftEye) + self.eye_aspect_ratio(rightEye)) / 2.0
+                mar = self.mouth_aspect_ratio(mouth)
+
+                # --- CORE LOGIC ---
                 is_eyes_closed = ear < self.calibrated_ear_threshold
                 is_mouth_open_wide = mar > self.YAWN_MAR_THRESHOLD
 
-                if is_mouth_open_wide and not is_smiling:
+                # Blink counting
+                if is_eyes_closed:
+                    self.blink_frame_counter += 1
+                else:
+                    if self.blink_frame_counter >= self.BLINK_CONSEC_FRAMES: self.blink_counter += 1
+                    self.blink_frame_counter = 0
+
+                # Blink rate analysis
+                if time.time() - self.blink_analysis_start_time > self.FATIGUE_BLINK_RATE_SECONDS:
+                    self.display_blink_rate = (self.blink_counter / self.FATIGUE_BLINK_RATE_SECONDS) * 60
+                    self.blink_counter = 0
+                    self.blink_analysis_start_time = time.time()
+
+                # Yawn counting
+                if is_mouth_open_wide:
                     if self.yawn_start_time is None:
                         self.yawn_start_time = time.time()
                     elif time.time() - self.yawn_start_time >= self.YAWN_DURATION_SECONDS:
+                        if not self.is_yawning:
+                            self.yawn_count += 1
+                            self.is_yawning = True
                         alert_triggered = True
                 else:
                     self.yawn_start_time = None
+                    self.is_yawning = False
 
-                if not alert_triggered and is_eyes_closed and not is_smiling:
+                # Head nod counting
+                nose_tip_y = np.mean([p[1] for p in nose])
+                self.head_positions.append(nose_tip_y)
+                if len(self.head_positions) > self.HEAD_NOD_FRAME_WINDOW:
+                    self.head_positions.pop(0)
+                    max_pos = max(self.head_positions)
+                    if max_pos - nose_tip_y > self.HEAD_NOD_THRESHOLD_PIXELS:
+                        if not self.is_nodding:
+                            self.nod_count += 1
+                            self.is_nodding = True
+                    else:
+                        self.is_nodding = False
+
+                # Your existing drowsiness logic
+                if not alert_triggered and is_eyes_closed:
                     if self.eye_closure_start_time is None:
                         self.eye_closure_start_time = time.time()
                     elif time.time() - self.eye_closure_start_time >= self.EYE_CLOSURE_SECONDS_THRESHOLD:
                         alert_triggered = True
-
                     self.drowsy_counter += 1
                     if self.drowsy_counter >= self.DROWSY_CONSEC_FRAMES:
                         alert_triggered = True
@@ -118,52 +214,30 @@ class DrowsinessDetector:
                     self.eye_closure_start_time = None
                     self.drowsy_counter = 0
 
-                if alert_triggered:
-                    status_text = "DROWSINESS ALERT!"
-                elif is_smiling:
-                    status_text = "Active (Smiling)"
-        else:
-            status_text = "No Face Detected"
-            self.eye_closure_start_time = None
-            self.drowsy_counter = 0
-            self.yawn_start_time = None
+                if alert_triggered: status_text = "DROWSINESS ALERT!"
+            else:
+                status_text = "No Face Detected"
+                self.reset_counters()
 
-        color = (0, 0, 255) if alert_triggered else (0, 255, 0)
-        cv2.putText(frame, f"Status: {status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        return frame
+            # --- DISPLAY ON-SCREEN TEXT ---
+            color = (0, 0, 255) if alert_triggered else (0, 255, 0)
+            cv2.putText(frame, f"Status: {status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-    def run(self):
-        print("[INFO] Starting video stream...")
-        vs = cv2.VideoCapture(self.CAMERA_SOURCE)
-        time.sleep(1.0)
+            time_to_decide = self.FATIGUE_BLINK_RATE_SECONDS - (time.time() - self.blink_analysis_start_time)
+            info_text_1 = f"Blink Rate: {self.display_blink_rate:.2f} bpm"
+            info_text_2 = f"Fatigue Check In: {int(time_to_decide)}s"
+            info_text_3 = f"Yawns: {self.yawn_count} | Nods: {self.nod_count}"
 
-        # Initial calibration
-        self.is_calibrating = True
-        self.last_recalibration_time = time.time()
+            cv2.putText(frame, info_text_1, (550, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(frame, info_text_2, (550, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(frame, info_text_3, (550, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        while True:
-            # Periodic recalibration check
-            if not self.is_calibrating and time.time() - self.last_recalibration_time > self.RECALIBRATION_INTERVAL_SECONDS:
-                self.is_calibrating = True
-                self.last_recalibration_time = time.time()
+            cv2.imshow("Drowsiness Detector", frame)
 
-            ret, frame = vs.read()
-            if not ret:
-                break
+            if cv2.waitKey(1) & 0xFF == ord("q"): break
 
-            frame = cv2.resize(frame, (800, 600))
-
-            processed_frame = self.process_frame(frame)
-
-            if processed_frame is not None:
-                cv2.imshow("Drowsiness Detector", processed_frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-
-        cv2.destroyAllWindows()
         vs.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
@@ -171,4 +245,4 @@ if __name__ == "__main__":
         detector = DrowsinessDetector()
         detector.run()
     except Exception as e:
-        print(e)
+        print(f"[FATAL ERROR] An unexpected error occurred: {e}")
