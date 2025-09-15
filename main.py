@@ -17,8 +17,8 @@ class DrowsinessDetector:
         self.EAR_PERCENTAGE_THRESHOLD = 0.85
         self.EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
         self.DROWSY_CONSEC_FRAMES = 25
-        self.YAWN_MAR_THRESHOLD = 0.9
-        self.YAWN_DURATION_SECONDS = 2.0
+        self.YAWN_MAR_THRESHOLD = 0.7
+        self.YAWN_DURATION_SECONDS = 1.5
         self.SMILE_THRESHOLD = 0.8
 
         # --- BLINK & FATIGUE DETECTION ---
@@ -163,6 +163,7 @@ class DrowsinessDetector:
                         self.mStart:self.mEnd], shape[self.nStart:self.nEnd]
                     ear = (self.eye_aspect_ratio(leftEye) + self.eye_aspect_ratio(rightEye)) / 2.0
                     mar = self.mouth_aspect_ratio(mouth)
+                    print(f"Current MAR: {mar:.2f}")  # <-- ADD THIS LINE
 
                     is_eyes_closed = ear < self.calibrated_ear_threshold
                     is_mouth_open_wide = mar > self.YAWN_MAR_THRESHOLD
@@ -203,19 +204,19 @@ class DrowsinessDetector:
                     else:
                         self.yawn_start_time = None;
                         self.is_yawning = False
-
-                    nose_tip_y = np.mean([p[1] for p in nose])
-                    self.head_positions.append(nose_tip_y)
-                    if len(self.head_positions) > self.HEAD_NOD_FRAME_WINDOW:
-                        self.head_positions.pop(0)
-                        if max(self.head_positions) - nose_tip_y > self.HEAD_NOD_THRESHOLD_PIXELS:
-                            if not self.is_nodding:
-                                self.nod_count += 1;
-                                self.fatigue_events.append(time.time());
-                                self.is_nodding = True
-                            drowsiness_event = True
-                        else:
-                            self.is_nodding = False
+                    if not is_mouth_open_wide:
+                        nose_tip_y = np.mean([p[1] for p in nose])
+                        self.head_positions.append(nose_tip_y)
+                        if len(self.head_positions) > self.HEAD_NOD_FRAME_WINDOW:
+                            self.head_positions.pop(0)
+                            if max(self.head_positions) - nose_tip_y > self.HEAD_NOD_THRESHOLD_PIXELS:
+                                if not self.is_nodding:
+                                    self.nod_count += 1;
+                                    self.fatigue_events.append(time.time());
+                                    self.is_nodding = True
+                                drowsiness_event = True
+                            else:
+                                self.is_nodding = False
 
                     if is_eyes_closed and not drowsiness_event:
                         if self.eye_closure_start_time is None:
