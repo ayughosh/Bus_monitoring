@@ -17,8 +17,8 @@ class DrowsinessDetector:
         self.EAR_PERCENTAGE_THRESHOLD = 0.85
         self.EYE_CLOSURE_SECONDS_THRESHOLD = 2.0
         self.DROWSY_CONSEC_FRAMES = 25
-        self.YAWN_MAR_THRESHOLD = 0.6
-        self.YAWN_DURATION_SECONDS = 2.5
+        self.YAWN_MAR_THRESHOLD = 0.9
+        self.YAWN_DURATION_SECONDS = 2.0
         self.SMILE_THRESHOLD = 0.8
 
         # --- BLINK & FATIGUE DETECTION ---
@@ -26,8 +26,8 @@ class DrowsinessDetector:
         self.FATIGUE_BLINK_RATE_SECONDS = 30
         self.FATIGUE_LOW_BLINK_THRESHOLD = 8
         self.FATIGUE_HIGH_BLINK_THRESHOLD = 40
-        self.FATIGUE_EVENT_WINDOW_SECONDS = 120
-        self.FATIGUE_EVENT_THRESHOLD = 3
+        self.FATIGUE_EVENT_WINDOW_SECONDS = 120  # <<< NEW
+        self.FATIGUE_EVENT_THRESHOLD = 3  # <<< NEW
 
         # --- HEAD NOD DETECTION ---
         self.HEAD_NOD_FRAME_WINDOW = 20
@@ -63,7 +63,7 @@ class DrowsinessDetector:
         self.head_positions = []
         self.is_yawning = False
         self.is_nodding = False
-        self.fatigue_events = []
+        self.fatigue_events = []  # <<< NEW
 
         # --- DLIB INITIALIZATION ---
         if not os.path.exists(self.DLIB_LANDMARK_MODEL):
@@ -143,8 +143,8 @@ class DrowsinessDetector:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             rects = self.detector(gray, 0)
 
-            status_text = "No Face Detected"
-            color = (0, 255, 0)
+            status_text = "No Face Detected"  # <<< MODIFIED
+            color = (0, 255, 0)  # <<< MODIFIED
 
             if len(rects) > 0:
                 largest_rect = max(rects, key=lambda rect: rect.width() * rect.height())
@@ -166,6 +166,8 @@ class DrowsinessDetector:
 
                     is_eyes_closed = ear < self.calibrated_ear_threshold
                     is_mouth_open_wide = mar > self.YAWN_MAR_THRESHOLD
+
+                    # --- START OF MODIFIED LOGIC ---
 
                     # --- Fatigue Analysis ---
                     if is_eyes_closed:
@@ -199,7 +201,8 @@ class DrowsinessDetector:
                                 self.is_yawning = True
                             drowsiness_event = True
                     else:
-                        self.yawn_start_time = None; self.is_yawning = False
+                        self.yawn_start_time = None;
+                        self.is_yawning = False
 
                     nose_tip_y = np.mean([p[1] for p in nose])
                     self.head_positions.append(nose_tip_y)
@@ -222,7 +225,7 @@ class DrowsinessDetector:
                     else:
                         self.eye_closure_start_time = None
 
-                    # --- STATE MACHINE LOGIC ---
+                    # --- NEW STATE MACHINE LOGIC ---
                     if self.current_state == self.STATE["ACTIVE"] and fatigue_detected:
                         self.current_state = self.STATE["FATIGUED"]
                     elif self.current_state == self.STATE["FATIGUED"]:
@@ -233,15 +236,18 @@ class DrowsinessDetector:
                     elif self.current_state == self.STATE["DROWSY"] and not drowsiness_event:
                         self.current_state = self.STATE["FATIGUED"]
 
-                    # Determine status text and color
+                    # Determine status text and color based on the final state
                     if self.current_state == self.STATE["DROWSY"]:
-                        status_text = "DROWSINESS ALERT!"; color = (0, 0, 255)
+                        status_text = "DROWSINESS ALERT!";
+                        color = (0, 0, 255)
                     elif self.current_state == self.STATE["FATIGUED"]:
-                        status_text = "Fatigue Detected"; color = (0, 165, 255)
+                        status_text = "Fatigue Detected";
+                        color = (0, 165, 255)
                     else:
                         status_text = "Active"
 
-            # Display logic
+                    # --- END OF MODIFIED LOGIC ---
+
             cv2.putText(frame, f"Status: {status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
             time_to_decide = self.FATIGUE_BLINK_RATE_SECONDS - (time.time() - self.blink_analysis_start_time)
@@ -252,6 +258,7 @@ class DrowsinessDetector:
             cv2.putText(frame, info_text_1, (550, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv2.putText(frame, info_text_2, (550, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv2.putText(frame, info_text_3, (550, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
             cv2.imshow("Drowsiness Detector", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"): break
