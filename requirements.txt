@@ -1,7 +1,0 @@
-tensorflow
-opencv-python
-numpy
-dlib
-scipy
-imutils
-inference
