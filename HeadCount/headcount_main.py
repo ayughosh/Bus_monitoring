@@ -10,8 +10,8 @@ def main():
     print("[INFO] Starting Bus Headcount System...")
 
     # --- CONFIGURATION ---
-    # Change this to the camera index for the entrance
-    camera_id = 0
+    # Change this to the camera index for your webcam (usually 0 or 1)
+    camera_id = 2
 
     try:
         # Initialize and run the system
