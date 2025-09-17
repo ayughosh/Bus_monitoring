@@ -1,30 +1,45 @@
 # headcount_main.py
-from bus_headcount_system import HeadCountSystem
 import sys
+from bus_headcount_system import HeadCountSystem
+
+# --- CONFIGURATION ---
+# Adjust these settings for your specific setup.
+CONFIG = {
+    "camera_source": 2,  # 0 for integrated, 1 or 2 for external webcam
+    "model_path": "models/yolov8n.pt",
+    "confidence_threshold": 0.5  # How sure the model must be (0.0 to 1.0)
+}
 
 
 def main():
     """
-    Main function to run the head counting system.
+    Initializes and runs the Bus Headcount System.
     """
-    print("[INFO] Starting Bus Headcount System...")
+    print("--- Starting Bus Headcount Monitoring System ---")
 
-    # --- CONFIGURATION ---
-    # Change this to the camera index for your webcam (usually 0 or 1)
-    camera_id = 2
-
+    head_counter = None
     try:
-        # Initialize and run the system
-        head_counter = HeadCountSystem(camera_source=camera_id)
-        head_counter.run()
-    except ConnectionError as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"[FATAL] An unexpected error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
+        head_counter = HeadCountSystem(
+            camera_source=CONFIG["camera_source"],
+            yolo_model_path=CONFIG["model_path"]
+        )
+        head_counter.run(conf_threshold=CONFIG["confidence_threshold"])
 
-    print("[INFO] System shutdown.")
+    except FileNotFoundError as e:
+        print(f"[FATAL ERROR] Model file not found. {e}", file=sys.stderr)
+        sys.exit(1)
+    except ConnectionError as e:
+        print(f"[FATAL ERROR] Camera not accessible. {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[INFO] Program interrupted by user.")
+    except Exception as e:
+        print(f"[FATAL ERROR] An unexpected error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if head_counter:
+            head_counter.cleanup()
+        print("--- System Shutdown ---")
 
 
 if __name__ == '__main__':
