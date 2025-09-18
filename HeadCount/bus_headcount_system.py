@@ -1,7 +1,7 @@
-# HeadCount/bus_headcount_system.py
+# HeadCount/bus_headcount_system_optimized.py
 """
-Improved Bus Head Count System with proper entry/exit detection
-and web streaming capability
+Optimized Bus Head Count System with horizontal line and top-down counting
+Performance optimizations for smooth video streaming
 """
 
 import cv2
@@ -21,46 +21,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class ImprovedHeadCountSystem:
+class OptimizedHeadCountSystem:
     """
-    Robust head counting system with improved tracking and entry/exit logic
+    Optimized head counting system with horizontal line for top-down movement
     """
 
     def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.pt",
                  zone_config=None, web_stream=True):
         """
-        Initialize the improved head count system
-
-        Args:
-            camera_source: Camera index or RTSP URL
-            yolo_model_path: Path to YOLO model
-            zone_config: Custom zone configuration
-            web_stream: Enable web streaming
+        Initialize the optimized head count system
         """
-        # Validate model path
         if not os.path.exists(yolo_model_path):
             logger.error(f"YOLO model not found at '{yolo_model_path}'")
             raise FileNotFoundError(f"YOLO model not found at '{yolo_model_path}'")
 
-        # Initialize camera with retry logic
+        # Performance settings
+        self.PROCESS_EVERY_N_FRAMES = 2  # Process every 2nd frame for better performance
+        self.RESIZE_WIDTH = 640  # Resize frame for faster processing
+        self.RESIZE_HEIGHT = 480
+        self.VIDEO_QUALITY = 70  # JPEG quality (1-100, lower = faster)
+
+        # Initialize camera with optimized settings
         self.camera_source = camera_source
         self.cap = self._initialize_camera(camera_source)
 
-        # Frame dimensions
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Get original dimensions
+        self.original_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.original_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Zone configuration
+        # Zone configuration - HORIZONTAL LINE for top-down counting
         if zone_config:
             self.COUNTING_ZONE = zone_config
         else:
-            # Default zone - vertical line in middle of frame
-            zone_y = self.frame_width // 2
+            # Default horizontal line in middle of frame
             self.COUNTING_ZONE = {
-                'y': zone_y,
-                'x1': 50,
-                'x2': self.frame_height - 50,
-                'threshold': 30  # pixels from line to trigger counting
+                'y': self.RESIZE_HEIGHT // 2,  # Horizontal line Y position
+                'x1': 0,  # Line start X
+                'x2': self.RESIZE_WIDTH,  # Line end X
+                'threshold': 40,  # Pixels from line to trigger counting
+                'direction': 'top_down'  # Entry from top, exit from bottom
             }
 
         # Load YOLO model
@@ -70,11 +69,11 @@ class ImprovedHeadCountSystem:
         # Tracking data structures
         self.tracks = {}  # track_id -> TrackInfo
         self.counts = {'entry': 0, 'exit': 0, 'current': 0}
-        self.track_history = deque(maxlen=1000)  # Keep history for debugging
+        self.track_history = deque(maxlen=500)  # Reduced history size
 
         # Web streaming
         self.web_stream = web_stream
-        self.frame_queue = queue.Queue(maxsize=5)
+        self.frame_queue = queue.Queue(maxsize=2)  # Smaller queue for less lag
         self.latest_frame = None
         self.stats_lock = threading.Lock()
 
@@ -82,128 +81,139 @@ class ImprovedHeadCountSystem:
         self.fps = 0
         self.last_fps_time = time.time()
         self.frame_count = 0
+        self.frame_skip_counter = 0
 
-        logger.info("Head count system initialized successfully")
+        logger.info("Optimized head count system initialized")
 
-    def _initialize_camera(self, source, max_retries=5):
-        """Initialize camera with retry logic"""
+    def _initialize_camera(self, source, max_retries=3):
+        """Initialize camera with optimized settings"""
         for attempt in range(max_retries):
             try:
-                # Try different approaches based on source type
                 if isinstance(source, str) and source.startswith(('rtsp://', 'http://')):
-                    # Network camera
                     cap = cv2.VideoCapture(source)
                 elif isinstance(source, str) and source.isdigit():
-                    # Camera index as string
                     cap = cv2.VideoCapture(int(source))
                 else:
-                    # Direct camera index or file
                     cap = cv2.VideoCapture(source)
 
                 if cap.isOpened():
-                    # Set camera properties for better performance
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    # Optimize camera settings for performance
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer
+                    cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS for smoother streaming
+
+                    # Set resolution if possible (some cameras ignore this)
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    # cap.set(cv2.CAP_PROP_FPS, 30)
-                    logger.info(f"Camera initialized successfully on attempt {attempt + 1}")
+
+                    logger.info(f"Camera initialized on attempt {attempt + 1}")
                     return cap
 
             except Exception as e:
                 logger.warning(f"Camera init attempt {attempt + 1} failed: {e}")
 
             if attempt < max_retries - 1:
-                time.sleep(2)  # Wait before retry
+                time.sleep(1)
 
-        raise ConnectionError(f"Could not open camera source '{source}' after {max_retries} attempts")
+        raise ConnectionError(f"Could not open camera source '{source}'")
 
-    def _calculate_direction(self, track_id, current_x):
-        """Calculate movement direction for a track"""
+    def _calculate_direction_vertical(self, track_id, current_y):
+        """Calculate movement direction for vertical movement (top-down or bottom-up)"""
         if track_id not in self.tracks:
             return None
 
         track = self.tracks[track_id]
-        if len(track['positions']) < 2:
+        if len(track['positions']) < 3:
             return None
 
-        # Get average of first and last positions
-        start_positions = track['positions'][:min(3, len(track['positions']))]
-        end_positions = track['positions'][-min(3, len(track['positions'])):]
+        # Convert deque to list before slicing
+        positions_list = list(track['positions'])
+
+        # Get average Y positions
+        start_positions = list(positions_list[:min(3, len(positions_list))])
+        end_positions = list(positions_list[-min(3, len(positions_list)):])
 
         avg_start_y = np.mean([p[1] for p in start_positions])
         avg_end_y = np.mean([p[1] for p in end_positions])
 
-        # Determine direction
-        if avg_end_y > avg_start_y + 10:  # Moving DOWN (entry)
-            return 'entry'
-        elif avg_end_y < avg_start_y - 10:  # Moving UP (exit)
-            return 'exit'
+        # Determine direction based on Y movement
+        movement = avg_end_y - avg_start_y
+
+        if self.COUNTING_ZONE['direction'] == 'top_down':
+            # Entry from top (smaller Y), exit from bottom (larger Y)
+            if movement > 15:  # Moving down (entry)
+                return 'entry'
+            elif movement < -15:  # Moving up (exit)
+                return 'exit'
+        else:  # bottom_up
+            # Entry from bottom, exit from top
+            if movement < -15:  # Moving up (entry)
+                return 'entry'
+            elif movement > 15:  # Moving down (exit)
+                return 'exit'
+
         return None
 
     def _update_tracking(self, track_id, bbox, center):
-        """Update tracking information for a person"""
+        """
+        MODIFIED: A simpler, more robust tracking and counting logic.
+        """
         current_time = time.time()
 
+        # Initialize new tracks (simplified, removed unused keys)
         if track_id not in self.tracks:
-            # New track
             self.tracks[track_id] = {
-                'positions': deque(maxlen=30),
+                'positions': deque(maxlen=20),
                 'bbox': bbox,
-                'first_seen': current_time,
                 'last_seen': current_time,
-                'counted': False,
-                'direction': None,
-                'crossed_line': False
+                'counted': False
             }
 
+        # Update track with current position
         track = self.tracks[track_id]
         track['positions'].append(center)
         track['bbox'] = bbox
         track['last_seen'] = current_time
 
-        # Check if crossing the counting line
+        # --- REPLACED COUNTING LOGIC ---
         zone = self.COUNTING_ZONE
-        line_x = zone['y']
+        line_y = zone['y']
         threshold = zone['threshold']
 
-        # Check if person is near the line
-        if abs(center[1] - line_x) < threshold:
-            if not track['crossed_line']:
-                # Determine direction when crossing
-                direction = self._calculate_direction(track_id, center[1])
+        # Check if the person is near the counting line and hasn't been counted yet
+        if not track['counted'] and abs(center[1] - line_y) < threshold:
 
-                if direction and not track['counted']:
-                    track['direction'] = direction
-                    track['counted'] = True
-                    track['crossed_line'] = True
+            # Determine the track's overall direction of movement
+            # This requires the _calculate_direction_vertical function to exist in your class
+            direction = self._calculate_direction_vertical(track_id, center[1])
 
-                    # Update counts
-                    with self.stats_lock:
-                        if direction == 'entry':
-                            self.counts['entry'] += 1
-                            self.counts['current'] += 1
-                            logger.info(f"Person {track_id} ENTERED. Total inside: {self.counts['current']}")
-                        else:
-                            self.counts['exit'] += 1
-                            self.counts['current'] = max(0, self.counts['current'] - 1)
-                            logger.info(f"Person {track_id} EXITED. Total inside: {self.counts['current']}")
+            if direction:
+                # If a clear direction is found, count the person and mark as counted
+                self._count_person(track_id, direction)
+                track['counted'] = True
 
-                    # Add to history
-                    self.track_history.append({
-                        'track_id': track_id,
-                        'direction': direction,
-                        'timestamp': current_time
-                    })
-        else:
-            # Reset crossed_line flag when person moves away from line
-            if track['crossed_line'] and abs(center[0] - line_x) > threshold * 2:
-                track['crossed_line'] = False
-                track['counted'] = False  # Allow re-counting if they cross again
+    def _count_person(self, track_id, direction):
+        """Count a person crossing the line (NO CHANGES NEEDED HERE)"""
+        with self.stats_lock:
+            if direction == 'entry':
+                self.counts['entry'] += 1
+                self.counts['current'] += 1
+                logger.info(f"Person {track_id} ENTERED. Total inside: {self.counts['current']}")
+            else:
+                self.counts['exit'] += 1
+                self.counts['current'] = max(0, self.counts['current'] - 1)
+                logger.info(f"Person {track_id} EXITED. Total inside: {self.counts['current']}")
+
+        # Add to history
+        self.track_history.append({
+            'track_id': track_id,
+            'direction': direction,
+            'timestamp': time.time()
+        })
 
     def _cleanup_old_tracks(self):
         """Remove tracks that haven't been seen recently"""
         current_time = time.time()
-        timeout = 2.0  # seconds
+        timeout = 3.0  # Increased timeout
 
         tracks_to_remove = []
         for track_id, track in self.tracks.items():
@@ -214,52 +224,55 @@ class ImprovedHeadCountSystem:
             del self.tracks[track_id]
 
     def _draw_visualization(self, frame, detections):
-        """Draw counting zone and tracking information"""
+        """Draw horizontal counting zone and tracking information"""
         zone = self.COUNTING_ZONE
 
-        # Draw counting line
-        cv2.line(frame, (zone['y'], zone['x1']), (zone['y'], zone['x2']),
+        # Draw horizontal counting line
+        cv2.line(frame, (zone['x1'], zone['y']), (zone['x2'], zone['y']),
                  (0, 255, 255), 3)
 
-        # Draw threshold zones
-        cv2.line(frame, (zone['y'] - zone['threshold'], zone['x1']),
-                 (zone['y'] - zone['threshold'], zone['x2']), (255, 255, 0), 1)
-        cv2.line(frame, (zone['y'] + zone['threshold'], zone['x1']),
-                 (zone['y'] + zone['threshold'], zone['x2']), (255, 255, 0), 1)
+        # Draw threshold zones (above and below the line)
+        cv2.line(frame, (zone['x1'], zone['y'] - zone['threshold']),
+                 (zone['x2'], zone['y'] - zone['threshold']), (255, 255, 0), 1)
+        cv2.line(frame, (zone['x1'], zone['y'] + zone['threshold']),
+                 (zone['x2'], zone['y'] + zone['threshold']), (255, 255, 0), 1)
 
-        # Draw zone label
-        cv2.putText(frame, "ENTRY/EXIT ZONE", (zone['y'] - 60, zone['x1'] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Draw zone labels
+        cv2.putText(frame, "ENTRY", (zone['y'], zone['y'] - zone['threshold'] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, "EXIT", (zone['y'], zone['y'] + zone['threshold'] + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         # Draw tracked persons
         for track_id, track in self.tracks.items():
             if len(track['positions']) > 0:
-                # Get latest position
                 center = track['positions'][-1]
                 bbox = track['bbox']
 
-                # Choose color based on state
-                if track['counted']:
-                    if track['direction'] == 'entry':
-                        color = (0, 255, 0)  # Green for entry
-                    else:
-                        color = (0, 0, 255)  # Red for exit
+                # Color based on position relative to line
+                if center[1] < zone['y'] - zone['threshold']:
+                    color = (0, 255, 0)  # Green above line
+                elif center[1] > zone['y'] + zone['threshold']:
+                    color = (0, 0, 255)  # Red below line
                 else:
-                    color = (255, 255, 0)  # Yellow for tracking
+                    color = (255, 255, 0)  # Yellow on line
 
                 # Draw bounding box
                 cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
 
-                # Draw ID and center point
+                # Draw ID
                 cv2.putText(frame, f"ID:{track_id}", (bbox[0], bbox[1] - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Draw center point
                 cv2.circle(frame, tuple(map(int, center)), 4, color, -1)
 
-                # Draw trajectory
+                # Draw short trajectory
                 if len(track['positions']) > 1:
-                    points = np.array([tuple(map(int, p)) for p in track['positions']],
-                                      dtype=np.int32)
-                    cv2.polylines(frame, [points], False, color, 1)
+                    points = list(track['positions'])[-10:]  # Last 10 points only
+                    for i in range(1, len(points)):
+                        cv2.line(frame, tuple(map(int, points[i - 1])),
+                                 tuple(map(int, points[i])), color, 1)
 
         # Draw statistics panel
         self._draw_stats_panel(frame)
@@ -267,10 +280,10 @@ class ImprovedHeadCountSystem:
         return frame
 
     def _draw_stats_panel(self, frame):
-        """Draw statistics panel on frame"""
-        # Create semi-transparent overlay
+        """Draw statistics panel"""
+        # Semi-transparent background
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (250, 150), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (250, 130), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
         # Draw statistics
@@ -278,23 +291,23 @@ class ImprovedHeadCountSystem:
             stats = [
                 f"Entries: {self.counts['entry']}",
                 f"Exits: {self.counts['exit']}",
-                f"Current: {self.counts['current']}",
+                f"Inside Bus: {self.counts['current']}",
                 f"FPS: {self.fps:.1f}"
             ]
 
-        y_offset = 40
+        y_offset = 35
         for stat in stats:
             cv2.putText(frame, stat, (20, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            y_offset += 30
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y_offset += 25
 
-        # Add timestamp
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(frame, timestamp, (10, frame.shape[0] - 10),
+        # Timestamp
+        timestamp = time.strftime("%H:%M:%S")
+        cv2.putText(frame, timestamp, (frame.shape[1] - 100, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     def _update_fps(self):
-        """Calculate and update FPS"""
+        """Calculate FPS"""
         self.frame_count += 1
         current_time = time.time()
 
@@ -304,39 +317,39 @@ class ImprovedHeadCountSystem:
             self.last_fps_time = current_time
 
     def process_frame(self, frame):
-        """Process a single frame for head counting"""
-        # Run YOLO detection with tracking
-        results = self.model.track(frame, persist=True, classes=[0],
-                                   conf=0.4, tracker="bytetrack.yaml")
+        """Process frame with optimization"""
+        # Resize frame for faster processing
+        small_frame = cv2.resize(frame, (self.RESIZE_WIDTH, self.RESIZE_HEIGHT))
 
-        detections = []
+        # Skip frames for performance
+        self.frame_skip_counter += 1
+        if self.frame_skip_counter % self.PROCESS_EVERY_N_FRAMES == 0:
+            # Run detection only on selected frames
+            results = self.model.track(small_frame, persist=True, classes=[0],
+                                       conf=0.3, tracker="bytetrack.yaml", verbose=False)
 
-        if results[0].boxes is not None and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-            track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+            if results[0].boxes is not None and results[0].boxes.id is not None:
+                print(f"DEBUG: Detected {len(results[0].boxes.id)} objects in this frame.")
+                boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+                track_ids = results[0].boxes.id.cpu().numpy().astype(int)
 
-            for box, track_id in zip(boxes, track_ids):
-                x1, y1, x2, y2 = box
+                for box, track_id in zip(boxes, track_ids):
+                    x1, y1, x2, y2 = box
 
-                # Calculate center of person (use upper body for better tracking)
-                center_x = (x1 + x2) // 2
-                center_y = y1 + (y2 - y1) // 3  # Upper third of bounding box
-                center = (center_x, center_y)
+                    # Calculate center (use upper body)
+                    center_x = (x1 + x2) // 2
+                    center_y = y1 + (y2 - y1) // 3
+                    center = (center_x, center_y)
 
-                # Update tracking
-                self._update_tracking(track_id, box, center)
+                    # Update tracking
+                    self._update_tracking(track_id, box, center)
 
-                detections.append({
-                    'track_id': track_id,
-                    'bbox': box,
-                    'center': center
-                })
+            # Clean up old tracks
+            if self.frame_skip_counter % 30 == 0:  # Clean every 30 frames
+                self._cleanup_old_tracks()
 
-        # Clean up old tracks
-        self._cleanup_old_tracks()
-
-        # Draw visualization
-        visualized_frame = self._draw_visualization(frame.copy(), detections)
+        # Always draw visualization (even on skipped frames)
+        visualized_frame = self._draw_visualization(small_frame.copy(), [])
 
         # Update FPS
         self._update_fps()
@@ -344,39 +357,47 @@ class ImprovedHeadCountSystem:
         return visualized_frame
 
     def run(self):
-        """Main processing loop"""
-        logger.info("Starting head count processing...")
+        """Main processing loop optimized for performance"""
+        logger.info("Starting optimized head count processing...")
 
         while True:
             ret, frame = self.cap.read()
             if not ret:
-                logger.warning("Failed to read frame, retrying...")
-                time.sleep(0.1)
+                logger.warning("Failed to read frame")
+                time.sleep(0.05)
                 continue
 
             # Process frame
             processed_frame = self.process_frame(frame)
 
-            # Update latest frame for web streaming
+            # Update for web streaming
             if self.web_stream:
                 self.latest_frame = processed_frame.copy()
 
-                # Try to put in queue, drop old frames if full
+                # Non-blocking queue update
                 try:
+                    # Clear old frames
+                    while not self.frame_queue.empty():
+                        try:
+                            self.frame_queue.get_nowait()
+                        except:
+                            break
+                    # Add new frame
                     self.frame_queue.put_nowait(processed_frame)
-                except queue.Full:
-                    try:
-                        self.frame_queue.get_nowait()
-                        self.frame_queue.put_nowait(processed_frame)
-                    except:
-                        pass
+                except:
+                    pass
 
-            # Display locally (optional)
+            # Display locally
             # cv2.imshow("Bus Head Count System", processed_frame)
 
             # Check for quit
-            # if cv2.waitKey(1) & 0xFF == ord('q'):
-            # break
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                with self.stats_lock:
+                    self.counts = {'entry': 0, 'exit': 0, 'current': 0}
+                logger.info("Counts reset")
 
         self.cleanup()
 
@@ -393,15 +414,14 @@ class ImprovedHeadCountSystem:
 
     def cleanup(self):
         """Clean up resources"""
-        logger.info("Cleaning up resources...")
+        logger.info("Cleaning up...")
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
 
 
-# Web server for streaming
-class HeadCountWebServer:
-    """Flask web server for streaming head count video"""
+class OptimizedWebServer:
+    """Optimized Flask web server for streaming"""
 
     def __init__(self, headcount_system, host='0.0.0.0', port=5000):
         self.app = Flask(__name__)
@@ -409,7 +429,6 @@ class HeadCountWebServer:
         self.host = host
         self.port = port
 
-        # Setup routes
         self.setup_routes()
 
     def setup_routes(self):
@@ -417,12 +436,14 @@ class HeadCountWebServer:
 
         @self.app.route('/')
         def index():
-            """Main page with video stream"""
+            """Main page"""
             return render_template_string('''
 <!DOCTYPE html>
 <html>
 <head>
     <title>Bus Head Count Monitor</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -438,6 +459,12 @@ class HeadCountWebServer:
         h1 {
             text-align: center;
             color: #00ff00;
+            margin-bottom: 10px;
+        }
+        .info {
+            text-align: center;
+            color: #888;
+            margin-bottom: 20px;
         }
         .video-container {
             text-align: center;
@@ -445,32 +472,65 @@ class HeadCountWebServer:
             border: 2px solid #00ff00;
             border-radius: 10px;
             overflow: hidden;
+            background: #000;
+        }
+        .video-container img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 0 auto;
         }
         .stats {
             display: flex;
             justify-content: space-around;
             margin: 20px 0;
+            flex-wrap: wrap;
         }
         .stat-box {
             background: #2a2a2a;
-            padding: 20px;
+            padding: 15px;
             border-radius: 10px;
             text-align: center;
             flex: 1;
-            margin: 0 10px;
+            margin: 5px;
+            min-width: 120px;
         }
         .stat-value {
-            font-size: 36px;
+            font-size: 32px;
             color: #00ff00;
-            margin: 10px 0;
+            margin: 5px 0;
+            font-weight: bold;
         }
         .stat-label {
-            font-size: 14px;
+            font-size: 12px;
             color: #888;
+            text-transform: uppercase;
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        button {
+            background: #00ff00;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            margin: 0 5px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #00dd00;
         }
         #timestamp {
             text-align: center;
             color: #888;
+            margin: 10px 0;
+        }
+        .direction-info {
+            text-align: center;
+            color: #ffff00;
             margin: 10px 0;
         }
     </style>
@@ -484,8 +544,15 @@ class HeadCountWebServer:
                     document.getElementById('current').textContent = data.current;
                     document.getElementById('fps').textContent = data.fps.toFixed(1);
                     document.getElementById('timestamp').textContent = 
-                        'Last updated: ' + new Date().toLocaleString();
+                        'Last updated: ' + new Date().toLocaleTimeString();
                 });
+        }
+
+        function resetCounts() {
+            if (confirm('Reset all counts to zero?')) {
+                fetch('/reset', {method: 'POST'})
+                    .then(() => updateStats());
+            }
         }
 
         setInterval(updateStats, 1000);
@@ -494,19 +561,21 @@ class HeadCountWebServer:
 </head>
 <body>
     <div class="container">
-        <h1>🚌 Bus Head Count Monitoring System</h1>
+        <h1>🚌 Bus Head Count Monitor</h1>
+        <div class="info">Karnataka Government Transport Safety System</div>
+        <div class="direction-info">↓ ENTRY (Top) | EXIT (Bottom) ↑</div>
 
         <div class="stats">
             <div class="stat-box">
-                <div class="stat-label">ENTRIES</div>
+                <div class="stat-label">Entries ↓</div>
                 <div class="stat-value" id="entries">0</div>
             </div>
             <div class="stat-box">
-                <div class="stat-label">EXITS</div>
+                <div class="stat-label">Exits ↑</div>
                 <div class="stat-value" id="exits">0</div>
             </div>
             <div class="stat-box">
-                <div class="stat-label">CURRENT</div>
+                <div class="stat-label">Inside Bus</div>
                 <div class="stat-value" id="current">0</div>
             </div>
             <div class="stat-box">
@@ -516,7 +585,11 @@ class HeadCountWebServer:
         </div>
 
         <div class="video-container">
-            <img src="/video_feed" width="100%" />
+            <img src="/video_feed" />
+        </div>
+
+        <div class="controls">
+            <button onclick="resetCounts()">Reset Counts</button>
         </div>
 
         <div id="timestamp"></div>
@@ -533,65 +606,85 @@ class HeadCountWebServer:
 
         @self.app.route('/stats')
         def stats():
-            """Get current statistics"""
+            """Get statistics"""
             return jsonify(self.headcount.get_stats())
 
+        @self.app.route('/reset', methods=['POST'])
+        def reset():
+            """Reset counts"""
+            with self.headcount.stats_lock:
+                self.headcount.counts = {'entry': 0, 'exit': 0, 'current': 0}
+            return jsonify({'status': 'reset'})
+
     def generate_frames(self):
-        """Generate frames for streaming"""
+        """Generate frames for streaming by pulling from the queue"""
         while True:
-            if self.headcount.latest_frame is not None:
-                # Encode frame
-                ret, buffer = cv2.imencode('.jpg', self.headcount.latest_frame)
-                if ret:
-                    frame = buffer.tobytes()
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            time.sleep(0.033)  # ~30 FPS
+            try:
+                # Block and wait for the next available frame from the queue.
+                # The timeout prevents it from waiting forever if the main thread stops.
+                frame = self.headcount.frame_queue.get(timeout=10)
+
+                # Encode the frame as JPEG
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if not ret:
+                    continue
+
+                frame_bytes = buffer.tobytes()
+
+                # Yield the frame in the multipart format
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+            except queue.Empty:
+                # If the queue is empty for 10 seconds, something might be wrong,
+                # but we continue to keep the client connection open.
+                logger.warning("Frame queue is empty, streaming is paused...")
+                continue
 
     def run(self):
-        """Start the web server"""
+        """Start web server"""
         logger.info(f"Starting web server on http://{self.host}:{self.port}")
         self.app.run(host=self.host, port=self.port, threaded=True)
 
 
-# Main entry point
+# Export the optimized versions with the original names for compatibility
+ImprovedHeadCountSystem = OptimizedHeadCountSystem
+HeadCountWebServer = OptimizedWebServer
+HeadCountSystem = OptimizedHeadCountSystem  # Fallback compatibility
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='Bus Head Count System')
-    parser.add_argument('--camera', type=str, default='0',
-                        help='Camera source (index or URL)')
-    parser.add_argument('--model', type=str, default='models/yolov8n.pt',
-                        help='Path to YOLO model')
-    parser.add_argument('--web', action='store_true',
-                        help='Enable web interface')
-    parser.add_argument('--host', type=str, default='0.0.0.0',
-                        help='Web server host')
-    parser.add_argument('--port', type=int, default=5000,
-                        help='Web server port')
+    parser = argparse.ArgumentParser(description='Optimized Bus Head Count System')
+    parser.add_argument('--camera', type=str, default='0', help='Camera source')
+    parser.add_argument('--model', type=str, default='models/yolov8n.pt', help='YOLO model path')
+    parser.add_argument('--web', action='store_true', help='Enable web interface')
+    parser.add_argument('--port', type=int, default=5000, help='Web port')
 
     args = parser.parse_args()
 
     try:
-        # Initialize head count system
-        headcount = ImprovedHeadCountSystem(
-            camera_source=args.camera if not args.camera.isdigit() else int(args.camera),
+        # Convert camera source
+        camera_source = int(args.camera) if args.camera.isdigit() else args.camera
+
+        # Initialize system
+        headcount = OptimizedHeadCountSystem(
+            camera_source=camera_source,
             yolo_model_path=args.model,
             web_stream=args.web
         )
 
         if args.web:
-            # Start web server in separate thread
-            web_server = HeadCountWebServer(headcount, args.host, args.port)
+            # Start web server
+            web_server = OptimizedWebServer(headcount, port=args.port)
             web_thread = threading.Thread(target=web_server.run)
             web_thread.daemon = True
             web_thread.start()
 
-            # Give server time to start
             time.sleep(2)
-            print(f"\n✅ Web interface available at http://{args.host}:{args.port}\n")
+            print(f"\n✅ Web interface: http://0.0.0.0:{args.port}\n")
 
-        # Run head counting
+        # Run system
         headcount.run()
 
     except Exception as e:
