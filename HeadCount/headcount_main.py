@@ -1,9 +1,3 @@
-# HeadCount/headcount_main.py
-"""
-Main entry point for Bus Head Count System
-Supports both the original HeadCountSystem and improved version with web interface
-"""
-
 import sys
 import os
 import threading
@@ -34,7 +28,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CONFIG = {
     "camera_source": os.environ.get("CAMERA_INDEX", "2"),  # Read from env or default to 2
-    "model_path": "models/yolov8n.onnx",
+    "model_path": "models/yolov8n.pt",
     "confidence_threshold": 0.5,
     "web_enabled": True,
     "web_host": "0.0.0.0",

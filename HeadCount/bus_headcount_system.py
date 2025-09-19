@@ -1,9 +1,3 @@
-# HeadCount/bus_headcount_system_optimized.py
-"""
-Optimized Bus Head Count System with horizontal line and top-down counting
-Performance optimizations for smooth video streaming
-"""
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -26,7 +20,7 @@ class OptimizedHeadCountSystem:
     Optimized head counting system with horizontal line for top-down movement
     """
 
-    def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.onnx",
+    def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.pt",
                  zone_config=None, web_stream=True):
         """
         Initialize the optimized head count system
@@ -154,43 +148,42 @@ class OptimizedHeadCountSystem:
         return None
 
     def _update_tracking(self, track_id, bbox, center):
-        """Final, robust logic for persistent tracking and re-counting."""
+        """
+        MODIFIED: A simpler, more robust tracking and counting logic.
+        """
         current_time = time.time()
 
-        # Initialize new tracks with a 'last_direction' state
+        # Initialize new tracks (simplified, removed unused keys)
         if track_id not in self.tracks:
             self.tracks[track_id] = {
                 'positions': deque(maxlen=20),
                 'bbox': bbox,
                 'last_seen': current_time,
-                'last_direction': None  # State to track last counted action
+                'counted': False
             }
 
+        # Update track with current position
         track = self.tracks[track_id]
         track['positions'].append(center)
         track['bbox'] = bbox
         track['last_seen'] = current_time
 
+        # --- REPLACED COUNTING LOGIC ---
         zone = self.COUNTING_ZONE
         line_y = zone['y']
+        threshold = zone['threshold']
 
-        # We need at least two points to determine movement
-        pos_history = track['positions']
-        if len(pos_history) < 2:
-            return
+        # Check if the person is near the counting line and hasn't been counted yet
+        if not track['counted'] and abs(center[1] - line_y) < threshold:
 
-        prev_y = pos_history[-2][1]  # Previous y-position
-        curr_y = pos_history[-1][1]  # Current y-position
+            # Determine the track's overall direction of movement
+            # This requires the _calculate_direction_vertical function to exist in your class
+            direction = self._calculate_direction_vertical(track_id, center[1])
 
-        # Entry Condition: If they crossed the line going DOWN and their last action wasn't also an entry
-        if (prev_y < line_y and curr_y >= line_y) and track['last_direction'] != 'entry':
-            self._count_person(track_id, 'entry')
-            track['last_direction'] = 'entry'
-
-        # Exit Condition: If they crossed the line going UP and their last action wasn't also an exit
-        elif (prev_y > line_y and curr_y <= line_y) and track['last_direction'] != 'exit':
-            self._count_person(track_id, 'exit')
-            track['last_direction'] = 'exit'
+            if direction:
+                # If a clear direction is found, count the person and mark as counted
+                self._count_person(track_id, direction)
+                track['counted'] = True
 
     def _count_person(self, track_id, direction):
         """Count a person crossing the line (NO CHANGES NEEDED HERE)"""
@@ -228,21 +221,23 @@ class OptimizedHeadCountSystem:
         """Draw horizontal counting zone and tracking information"""
         zone = self.COUNTING_ZONE
 
-        # Draw horizontal counting line and threshold zones
+        # Draw horizontal counting line
         cv2.line(frame, (zone['x1'], zone['y']), (zone['x2'], zone['y']),
                  (0, 255, 255), 3)
+
+        # Draw threshold zones (above and below the line)
         cv2.line(frame, (zone['x1'], zone['y'] - zone['threshold']),
                  (zone['x2'], zone['y'] - zone['threshold']), (255, 255, 0), 1)
         cv2.line(frame, (zone['x1'], zone['y'] + zone['threshold']),
                  (zone['x2'], zone['y'] + zone['threshold']), (255, 255, 0), 1)
 
         # Draw zone labels
-        cv2.putText(frame, "ENTRY", (10, zone['y'] - zone['threshold'] - 10),
+        cv2.putText(frame, "ENTRY", (zone['x1'], zone['y'] - zone['threshold'] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, "EXIT", (10, zone['y'] + zone['threshold'] + 25),
+        cv2.putText(frame, "EXIT", (zone['x1'], zone['y'] + zone['threshold'] + 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        # Draw ALL tracked persons, regardless of position
+        # Draw tracked persons
         for track_id, track in self.tracks.items():
             if len(track['positions']) > 0:
                 center = track['positions'][-1]
@@ -256,18 +251,24 @@ class OptimizedHeadCountSystem:
                 else:
                     color = (255, 255, 0)  # Yellow on line
 
-                # Draw bounding box, ID, center point, and trajectory
+                # Draw bounding box
                 cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+
+                # Draw ID
                 cv2.putText(frame, f"ID:{track_id}", (bbox[0], bbox[1] - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Draw center point
                 cv2.circle(frame, tuple(map(int, center)), 4, color, -1)
 
+                # Draw short trajectory
                 if len(track['positions']) > 1:
-                    points = list(track['positions'])[-10:]
+                    points = list(track['positions'])[-10:]  # Last 10 points only
                     for i in range(1, len(points)):
                         cv2.line(frame, tuple(map(int, points[i - 1])),
                                  tuple(map(int, points[i])), color, 1)
 
+        # Draw statistics panel
         self._draw_stats_panel(frame)
         return frame
 
