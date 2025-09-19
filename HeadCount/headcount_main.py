@@ -34,7 +34,7 @@ except ImportError:
 # --- CONFIGURATION ---
 CONFIG = {
     "camera_source": os.environ.get("CAMERA_INDEX", "2"),  # Read from env or default to 2
-    "model_path": "models/yolov8n.pt",
+    "model_path": "models/yolov8n.onnx",
     "confidence_threshold": 0.5,
     "web_enabled": True,
     "web_host": "0.0.0.0",

@@ -26,7 +26,7 @@ class OptimizedHeadCountSystem:
     Optimized head counting system with horizontal line for top-down movement
     """
 
-    def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.pt",
+    def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.onnx",
                  zone_config=None, web_stream=True):
         """
         Initialize the optimized head count system
