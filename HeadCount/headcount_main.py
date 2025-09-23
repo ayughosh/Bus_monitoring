@@ -27,7 +27,7 @@ except ImportError:
 
 # --- CONFIGURATION ---
 CONFIG = {
-    "camera_source": os.environ.get("CAMERA_INDEX", "2"),  # Read from env or default to 2
+    "camera_source": os.environ.get("CAMERA_INDEX", "0"),  # Read from env or default to 2
     "model_path": "models/yolov8n.pt",
     "confidence_threshold": 0.5,
     "web_enabled": True,
@@ -195,17 +195,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run with default camera and web interface
-  python headcount_main.py --web
+# Run with default camera and web interface
+python headcount_main.py --web
 
-  # Run with specific camera
-  python headcount_main.py --camera 1 --web
+# Run with specific camera
+python headcount_main.py --camera 1 --web
 
-  # Run without web interface (console only)
-  python headcount_main.py --no-web
+# Run without web interface (console only)
+python headcount_main.py --no-web
 
-  # Run with custom web port
-  python headcount_main.py --web --port 8080
+# Run with custom web port
+python headcount_main.py --web --port 8080
         """
     )
 

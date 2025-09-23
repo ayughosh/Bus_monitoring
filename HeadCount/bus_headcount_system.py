@@ -21,7 +21,7 @@ class OptimizedHeadCountSystem:
     """
 
     def __init__(self, camera_source=0, yolo_model_path="models/yolov8n.pt",
-                 zone_config=None, web_stream=True):
+                zone_config=None, web_stream=True):
         """
         Initialize the optimized head count system
         """
@@ -223,13 +223,13 @@ class OptimizedHeadCountSystem:
 
         # Draw horizontal counting line
         cv2.line(frame, (zone['x1'], zone['y']), (zone['x2'], zone['y']),
-                 (0, 255, 255), 3)
+                (0, 255, 255), 3)
 
         # Draw threshold zones (above and below the line)
         cv2.line(frame, (zone['x1'], zone['y'] - zone['threshold']),
-                 (zone['x2'], zone['y'] - zone['threshold']), (255, 255, 0), 1)
+                (zone['x2'], zone['y'] - zone['threshold']), (255, 255, 0), 1)
         cv2.line(frame, (zone['x1'], zone['y'] + zone['threshold']),
-                 (zone['x2'], zone['y'] + zone['threshold']), (255, 255, 0), 1)
+                (zone['x2'], zone['y'] + zone['threshold']), (255, 255, 0), 1)
 
         # Draw zone labels
         cv2.putText(frame, "ENTRY", (zone['x1'], zone['y'] - zone['threshold'] - 10),
@@ -319,7 +319,7 @@ class OptimizedHeadCountSystem:
         if self.frame_skip_counter % self.PROCESS_EVERY_N_FRAMES == 0:
             # Run detection only on selected frames
             results = self.model.track(small_frame, persist=True, classes=[0],
-                                       conf=0.3, tracker="bytetrack.yaml", verbose=False)
+                                    conf=0.3, tracker="bytetrack.yaml", verbose=False)
 
             if results[0].boxes is not None and results[0].boxes.id is not None:
                 print(f"DEBUG: Detected {len(results[0].boxes.id)} objects in this frame.")
@@ -626,7 +626,7 @@ class OptimizedWebServer:
 
                 # Yield the frame in the multipart format
                 yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
             except queue.Empty:
                 # If the queue is empty for 10 seconds, something might be wrong,

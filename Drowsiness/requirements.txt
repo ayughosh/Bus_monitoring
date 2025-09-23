@@ -5,3 +5,4 @@ dlib
 scipy
 imutils
 inference
+cv2
