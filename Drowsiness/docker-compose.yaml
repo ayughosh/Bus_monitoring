@@ -1,0 +1,39 @@
+# docker-compose.yml
+#
+# Main Docker Compose file to run both the Drowsiness and HeadCount services.
+# Place this file in your root project directory (e.g., 'Face sensor').
+# Run with: docker-compose up --build -d
+
+version: '3.8'
+
+services:
+  # --- Drowsiness Detection Service ---
+  drowsiness-detector:
+    build:
+      context: ./Drowsiness
+      dockerfile: Dockerfile
+    container_name: drowsiness-monitor
+    restart: unless-stopped
+    privileged: true # Required for camera access
+    devices:
+      - /dev/video0:/dev/video0 # Maps the first camera to the container
+
+  # --- HeadCount Service ---
+  headcount-detector:
+    build:
+      context: ./HeadCount
+      dockerfile: Dockerfile # Assumes a Dockerfile exists in ./HeadCount
+    container_name: headcount-monitor
+    restart: unless-stopped
+    privileged: true # Required for camera access
+    devices:
+      - /dev/video1:/dev/video1 # Maps the second camera to the container
+    ports:
+      - "5000:5000" # Exposes the web UI on port 5000
+    volumes:
+      # Mounts the shared models directory into the container
+      - ./models:/app/models:ro
+
+networks:
+  default:
+    name: bus-monitor-net

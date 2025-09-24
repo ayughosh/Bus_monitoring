@@ -27,7 +27,7 @@ class DrowsinessDetector:
         self.SMOOTH_WINDOW = 5
         self.OUTLIER_FACTOR = 2.0
         self.MIN_FACE_SIZE = 80
-        self.MAX_FACE_MOVEMENT = 0.3  # Max 30% size change
+        self.MAX_FACE_MOVEMENT = 0.6  # Max 30% size change
         
         # --- BLINK & FATIGUE DETECTION ---
         self.BLINK_CONSEC_FRAMES = 5  # Increased from 3
@@ -43,7 +43,7 @@ class DrowsinessDetector:
 
         # --- RECALIBRATION SETTINGS ---
         self.CALIBRATION_FRAMES = 100  # Increased for better baseline
-        self.RECALIBRATION_INTERVAL_SECONDS = 120  # Every 2 minutes
+        self.RECALIBRATION_INTERVAL_SECONDS = 80  # Every 2 minutes
         self.FACE_TRACKING_TOLERANCE_PIXELS = 75
         self.RECALIBRATION_CANDIDATE_SECONDS = 3.0
 
