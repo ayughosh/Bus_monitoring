@@ -10,30 +10,15 @@ services:
   # --- Drowsiness Detection Service ---
   drowsiness-detector:
     build:
-      context: ./Drowsiness
+      context: .
       dockerfile: Dockerfile
     container_name: drowsiness-monitor
     restart: unless-stopped
     privileged: true # Required for camera access
     devices:
-      - /dev/video0:/dev/video0 # Maps the first camera to the container
-
-  # --- HeadCount Service ---
-  headcount-detector:
-    build:
-      context: ./HeadCount
-      dockerfile: Dockerfile # Assumes a Dockerfile exists in ./HeadCount
-    container_name: headcount-monitor
-    restart: unless-stopped
-    privileged: true # Required for camera access
-    devices:
-      - /dev/video1:/dev/video1 # Maps the second camera to the container
+      - /dev/video10:/dev/video10
+      - /dev/galcore:/dev/galcore
+      - /dev/mxc_hantro:/dev/mxc_hantro
+      - /dev/mxc_hantro_vc8000e:/dev/mxc_hantro_vc8000e
     ports:
-      - "5000:5000" # Exposes the web UI on port 5000
-    volumes:
-      # Mounts the shared models directory into the container
-      - ./models:/app/models:ro
-
-networks:
-  default:
-    name: bus-monitor-net
+      - "5000:5000"

@@ -19,7 +19,7 @@ detector_instance = None
 class DrowsinessDetector:
     def __init__(self):
         # --- SETTINGS ---
-        self.CAMERA_SOURCE = 0
+        self.CAMERA_SOURCE = 10
         self.DLIB_LANDMARK_MODEL = "shape_predictor_68_face_landmarks.dat"
 
         # --- ADAPTIVE THRESHOLDS (Conservative for robustness) ---

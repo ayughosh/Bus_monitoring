@@ -1,55 +1,47 @@
-# Drowsiness/Dockerfile
-#
-# Dockerfile for the Drowsiness Detection application.
-# It uses a multi-stage build for a smaller and more secure final image.
+FROM torizon/wayland-base-dev-imx8:4
 
-# --- Stage 1: Builder ---
-# Use a full Python image to install dependencies and download the model.
-FROM python:3.9-slim as builder
-
-# Install system dependencies needed for dlib and opencv
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+    pkg-config \
+    libatlas-base-dev \
+    libopenblas-dev \
+    liblapack-dev \
+    libx11-dev \
+    libgtk-3-dev \
+    libboost-python-dev \
+    libboost-thread-dev \
+    libatlas-base-dev \
+    libopencv-dev \
+    python3-opencv \
     wget \
     bzip2 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copy and install Python requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Download the dlib facial landmark model
-RUN wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && \
-    bzip2 -d shape_predictor_68_face_landmarks.dat.bz2
-
-
-# --- Stage 2: Final Image ---
-# Use a slim Python image for the final container
-FROM python:3.9-slim
-
-# Install only the necessary runtime system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    python3-full \
+    python3-dev \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy the installed Python packages from the builder stage
-COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY requirements.txt /app/requirements.txt
+# --- Add a 2GB swap file to provide enough memory for compilation ---
+RUN fallocate -l 2G /swapfile && \
+    chmod 600 /swapfile && \
+    mkswap /swapfile && \
+    swapon /swapfile
 
-# Copy your application code
+# Run pip install. This will now compile dlib, which will be slow.
+RUN pip3 install -r requirements.txt --break-system-packages
+
+# --- Turn off swap and remove the temporary file ---
+RUN swapoff /swapfile && \
+    rm /swapfile
+
+COPY shape_predictor_68_face_landmarks.dat .
 COPY drowsiness_main.py .
 COPY drowsiness_detector.py .
 COPY config.py .
 
-# Copy the downloaded dlib model from the builder stage
-COPY --from=builder /app/shape_predictor_68_face_landmarks.dat .
-
-# Set the command to run your application
 CMD ["python", "drowsiness_main.py"]

@@ -1,7 +1,7 @@
-tensorflow
 opencv-python
-numpy
 dlib
+numpy
 scipy
 imutils
-inference
+Flask
+Pillow
