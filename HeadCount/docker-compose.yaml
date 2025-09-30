@@ -2,19 +2,18 @@
 version: '3.8'
 
 services:
-  headcount-detector:
-    build:
-      context: ./HeadCount
-      dockerfile: Dockerfile # Use the NPU-enabled Dockerfile
-    container_name: headcount-monitor
-    privileged: true # Often required for hardware access
+  headcount:
+    build: .
+    container_name: bus-headcount
+    restart: unless-stopped
+    privileged: true
     devices:
-      - /dev/video1:/dev/video1  # Your camera
-      - /dev/galcore:/dev/galcore  # The NPU/GPU device on i.MX boards
-    volumes:
-      # Mount the NPU delegate library from the host into the container
-      - /usr/lib/libvx_delegate.so:/usr/lib/libvx_delegate.so:ro
-      - ./models:/app/models:ro # Mount models
+      - /dev/video0:/dev/video0
     ports:
       - "5000:5000"
-    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+    environment:
+      - CAMERA_INDEX=10
+      - PYTHONUNBUFFERED=1
