@@ -13,6 +13,7 @@ import threading
 import queue
 from flask import Flask, Response, render_template_string, jsonify
 
+
 # Constants - ADJUSTED FOR MOVEMENT
 EYE_AR_THRESH = 0.25
 EYE_AR_CONSEC_FRAMES = 60
