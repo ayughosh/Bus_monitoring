@@ -20,6 +20,13 @@ EYE_AR_CONSEC_FRAMES = 60
 YAWN_MAR_THRESH = 0.6
 MOUTH_CHANGE_THRESH = 0.05
 
+# Yawn Detection Parameters
+YAWN_MIN_DURATION = 1.0  # Minimum duration in seconds for valid yawn
+YAWN_MAX_DURATION = 6.0  # Maximum duration in seconds for valid yawn
+YAWN_OPENING_RATE_THRESH = 0.05  # Minimum MAR increase rate per frame
+YAWN_MAR_INCREASE_THRESH = 1.5  # Yawn MAR must be 1.5x baseline
+YAWN_COOLDOWN_FRAMES = 30  # Frames to wait before detecting another yawn
+
 CALIBRATION_FRAMES = 100
 MIN_CONFIDENCE_THRESHOLD = 0.60
 SMOOTH_WINDOW_SIZE = 7
@@ -52,6 +59,16 @@ face_lost_counter = 0
 last_ear = 0.30
 last_mar = 0.30
 last_valid_frame_time = time.time()
+
+# Yawn detection state
+yawn_state = "IDLE"  # States: IDLE, OPENING, PEAK, CLOSING
+yawn_start_time = None
+yawn_peak_mar = 0.0
+yawn_frame_count = 0
+yawn_cooldown_counter = 0
+previous_mar = 0.0
+yawn_detected_count = 0
+mar_rate_history = deque(maxlen=5)
 
 # Web streaming variables
 frame_queue = queue.Queue(maxsize=10)
@@ -132,6 +149,108 @@ def calculate_confidence(ear, mar, calibrated_ear, calibrated_mar_base, ear_std,
         confidence += stability * 0.2
 
     return min(1.0, confidence)
+
+
+def detect_yawn_robust(current_mar, calibrated_mar_base, frame_time):
+    """
+    Robust yawn detection using state machine with temporal validation.
+    Returns: (is_yawning, yawn_confidence, yawn_phase)
+    """
+    global yawn_state, yawn_start_time, yawn_peak_mar, yawn_frame_count
+    global yawn_cooldown_counter, previous_mar, yawn_detected_count, mar_rate_history
+
+    # Decrease cooldown counter
+    if yawn_cooldown_counter > 0:
+        yawn_cooldown_counter -= 1
+        return False, 0.0, "cooldown"
+
+    # Calculate MAR change rate
+    mar_rate = current_mar - previous_mar
+    mar_rate_history.append(mar_rate)
+    previous_mar = current_mar
+
+    # Define dynamic threshold based on calibrated baseline
+    yawn_threshold = calibrated_mar_base * YAWN_MAR_INCREASE_THRESH
+
+    is_yawning = False
+    yawn_confidence = 0.0
+    yawn_phase = yawn_state.lower()
+
+    # State machine for yawn detection
+    if yawn_state == "IDLE":
+        # Check for mouth opening with sufficient rate
+        if current_mar > yawn_threshold and mar_rate > YAWN_OPENING_RATE_THRESH:
+            yawn_state = "OPENING"
+            yawn_start_time = frame_time
+            yawn_peak_mar = current_mar
+            yawn_frame_count = 1
+
+    elif yawn_state == "OPENING":
+        yawn_frame_count += 1
+
+        # Track peak MAR
+        if current_mar > yawn_peak_mar:
+            yawn_peak_mar = current_mar
+
+        # Check if mouth is still opening or at peak
+        if current_mar > yawn_threshold:
+            # Check if rate is slowing down (approaching peak)
+            if abs(mar_rate) < YAWN_OPENING_RATE_THRESH * 0.5:
+                yawn_state = "PEAK"
+        else:
+            # Mouth closed too quickly - false positive
+            yawn_state = "IDLE"
+            yawn_start_time = None
+
+    elif yawn_state == "PEAK":
+        yawn_frame_count += 1
+
+        # Update peak if still increasing
+        if current_mar > yawn_peak_mar:
+            yawn_peak_mar = current_mar
+
+        # Check for closing motion (negative rate)
+        if mar_rate < -YAWN_OPENING_RATE_THRESH * 0.3:
+            yawn_state = "CLOSING"
+
+        # Timeout if staying at peak too long
+        if yawn_start_time and (frame_time - yawn_start_time) > YAWN_MAX_DURATION:
+            yawn_state = "IDLE"
+            yawn_start_time = None
+
+    elif yawn_state == "CLOSING":
+        yawn_frame_count += 1
+
+        # Check if mouth has returned close to baseline
+        if current_mar < calibrated_mar_base * 1.2:
+            # Validate yawn duration
+            if yawn_start_time:
+                yawn_duration = frame_time - yawn_start_time
+
+                if YAWN_MIN_DURATION <= yawn_duration <= YAWN_MAX_DURATION:
+                    # Valid yawn detected!
+                    is_yawning = True
+                    yawn_detected_count += 1
+
+                    # Calculate confidence based on duration and peak MAR
+                    duration_score = min(1.0, yawn_duration / 3.0)
+                    peak_score = min(1.0, (yawn_peak_mar / calibrated_mar_base - 1.0) / 0.5)
+                    yawn_confidence = (duration_score * 0.6 + peak_score * 0.4)
+
+                    # Set cooldown to prevent double-counting
+                    yawn_cooldown_counter = YAWN_COOLDOWN_FRAMES
+
+            # Reset state
+            yawn_state = "IDLE"
+            yawn_start_time = None
+            yawn_frame_count = 0
+
+        # Timeout check
+        elif yawn_start_time and (frame_time - yawn_start_time) > YAWN_MAX_DURATION:
+            yawn_state = "IDLE"
+            yawn_start_time = None
+
+    return is_yawning, yawn_confidence, yawn_phase
 
 
 def enhanced_calibration(vs, detector, predictor):
@@ -288,12 +407,14 @@ def index():
                 .then(response => response.json())
                 .then(data => {
                     document.getElementById('status').textContent = data.status;
-                    document.getElementById('status').className = 
+                    document.getElementById('status').className =
                         data.status.includes('ALERT') ? 'status-alert' :
-                        data.status.includes('Warning') ? 'status-warning' : 'status-active';
+                        data.status.includes('Warning') || data.status.includes('YAWN') ? 'status-warning' : 'status-active';
                     document.getElementById('confidence').textContent = data.confidence.toFixed(2);
                     document.getElementById('ear').textContent = data.ear.toFixed(2);
                     document.getElementById('mar').textContent = data.mar.toFixed(2);
+                    document.getElementById('yawn_count').textContent = data.yawn_count || 0;
+                    document.getElementById('yawn_phase').textContent = data.yawn_phase || 'idle';
                 });
         }
 
@@ -325,6 +446,14 @@ def index():
             <div class="stat-box">
                 <h3>MAR</h3>
                 <h2 id="mar">0.00</h2>
+            </div>
+            <div class="stat-box">
+                <h3>Yawn Count</h3>
+                <h2 id="yawn_count">0</h2>
+            </div>
+            <div class="stat-box">
+                <h3>Yawn Phase</h3>
+                <h2 id="yawn_phase">idle</h2>
             </div>
         </div>
 
@@ -456,15 +585,32 @@ def main_detection_loop():
                     eye_std_dev, mouth_std_dev, is_moving
                 )
 
+                # Robust yawn detection
+                current_time = time.time()
+                is_yawning, yawn_confidence, yawn_phase = detect_yawn_robust(
+                    mar, calibrated_mouth_baseline, current_time
+                )
+
                 # Draw contours
                 leftEyeHull = cv2.convexHull(leftEye)
                 rightEyeHull = cv2.convexHull(rightEye)
+                mouthHull = cv2.convexHull(mouth)
                 cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
                 cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
 
+                # Color mouth based on yawn phase
+                if yawn_phase == "opening":
+                    cv2.drawContours(frame, [mouthHull], -1, (0, 255, 255), 2)  # Yellow
+                elif yawn_phase == "peak":
+                    cv2.drawContours(frame, [mouthHull], -1, (0, 165, 255), 2)  # Orange
+                elif yawn_phase == "closing":
+                    cv2.drawContours(frame, [mouthHull], -1, (255, 0, 255), 2)  # Magenta
+                else:
+                    cv2.drawContours(frame, [mouthHull], -1, (0, 255, 0), 1)  # Green
+
                 # Detection logic
                 eyes_closed = ear < calibrated_eye_threshold
-                yawn_detected = mar > calibrated_mouth_threshold
+                yawn_detected = is_yawning  # Use robust yawn detection
                 mouth_not_moving = abs(mar - calibrated_mouth_baseline) < MOUTH_CHANGE_THRESH
 
                 min_conf = MIN_CONFIDENCE_THRESHOLD * 0.8 if is_moving else MIN_CONFIDENCE_THRESHOLD
@@ -486,9 +632,15 @@ def main_detection_loop():
                 if DROWSY_ALERT:
                     status_text = "DROWSINESS ALERT!"
                     color = (0, 0, 255)
+                elif is_yawning:
+                    status_text = "YAWN DETECTED!"
+                    color = (0, 165, 255)
                 elif EYE_CLOSED_COUNTER > EYE_AR_CONSEC_FRAMES // 2:
                     status_text = "Warning"
                     color = (0, 165, 255)
+                elif yawn_phase != "idle" and yawn_phase != "cooldown":
+                    status_text = f"Active (Yawn {yawn_phase})"
+                    color = (0, 255, 255)
                 elif is_moving:
                     status_text = "Active (Moving)"
                     color = (0, 255, 0)
@@ -498,13 +650,19 @@ def main_detection_loop():
                     "status": status_text,
                     "confidence": float(confidence_score),
                     "ear": float(ear),
-                    "mar": float(mar)
+                    "mar": float(mar),
+                    "yawn_count": yawn_detected_count,
+                    "yawn_phase": yawn_phase
                 }
 
         # Add status text to frame
         cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.putText(frame, f"Conf: {confidence_score:.2f}", (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255),
-                    2)
+        cv2.putText(frame, f"Conf: {confidence_score:.2f}", (450, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Display yawn counter if any yawns detected
+        if 'yawn_detected_count' in globals() and yawn_detected_count > 0:
+            cv2.putText(frame, f"Yawns: {yawn_detected_count}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # Put frame in queue for web streaming
         try:
