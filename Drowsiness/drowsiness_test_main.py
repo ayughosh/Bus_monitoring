@@ -701,8 +701,9 @@ class SimpleDrowsinessDetector:
 
             # Run face detection every 3rd frame for better performance (from every 2nd)
             # This improves FPS from ~20 to ~27-30 FPS
+            # Detection level 1 = more accurate, fewer false positives (was 0)
             if fps_counter % 3 == 0:
-                rects = self.detector(gray_processed, 0)
+                rects = self.detector(gray_processed, 1)
             else:
                 rects = getattr(self, 'last_rects', [])
 
@@ -743,6 +744,46 @@ class SimpleDrowsinessDetector:
                         rightEye = shape[self.rStart:self.rEnd]
                         mouth = shape[self.mStart:self.mEnd]
                         nose = shape[self.nStart:self.nEnd]
+
+                        # VALIDATE FACE LANDMARKS - Filter out false positives (fans, objects, etc.)
+                        # Check 1: Eye landmarks should be reasonable
+                        left_eye_width = dist.euclidean(leftEye[0], leftEye[3])
+                        right_eye_width = dist.euclidean(rightEye[0], rightEye[3])
+                        mouth_width = dist.euclidean(mouth[0], mouth[6])
+
+                        # Check 2: Face proportions should be human-like
+                        # Eyes should be similar width (within 50% of each other)
+                        if left_eye_width > 0 and right_eye_width > 0:
+                            eye_width_ratio = min(left_eye_width, right_eye_width) / max(left_eye_width, right_eye_width)
+                        else:
+                            eye_width_ratio = 0
+
+                        # Check 3: Mouth should be wider than eyes (typical human face)
+                        if left_eye_width > 0 and mouth_width > 0:
+                            mouth_to_eye_ratio = mouth_width / left_eye_width
+                        else:
+                            mouth_to_eye_ratio = 0
+
+                        # Check 4: Landmarks should not be too spread out (indicates false detection)
+                        face_landmark_spread = np.std([p[0] for p in shape]) + np.std([p[1] for p in shape])
+
+                        # REJECT if landmarks don't look like a real face
+                        is_valid_face = (
+                            eye_width_ratio > 0.5 and              # Eyes similar width
+                            1.5 < mouth_to_eye_ratio < 4.0 and     # Mouth wider than eyes
+                            left_eye_width > 5 and                 # Eyes not too small
+                            right_eye_width > 5 and
+                            face_landmark_spread < 200              # Landmarks not too scattered
+                        )
+
+                        if not is_valid_face:
+                            # This looks like a false positive (fan, object, pattern)
+                            status_text = "Invalid Face Pattern"
+                            color = (255, 100, 0)  # Orange-red
+                            cv2.putText(frame, "FALSE DETECTION", (x, y - 10),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                            valid_face_detected = False
+                            raise Exception("Invalid face landmarks")
 
                         ear_raw = (self.eye_aspect_ratio(leftEye) + self.eye_aspect_ratio(rightEye)) / 2.0
                         mar_raw = self.mouth_aspect_ratio(mouth)
