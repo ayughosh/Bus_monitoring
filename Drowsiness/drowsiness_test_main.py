@@ -527,34 +527,64 @@ class SimpleDrowsinessDetector:
             # UDP is faster than TCP and has lower latency
             rtsp_url_with_options = self.CAMERA_SOURCE
 
-            # Use GStreamer pipeline for better RTSP handling (more reliable than FFMPEG for IP cameras)
+            # Try GStreamer pipeline for better RTSP handling
             # This pipeline handles network issues, packet loss, and provides smooth playback
             gst_pipeline = (
-                f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=udp ! "
+                f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=4 buffer-mode=0 ! "
                 "rtph264depay ! h264parse ! avdec_h264 ! "
-                "videoconvert ! video/x-raw,format=BGR ! appsink drop=1 sync=0"
+                "videoconvert ! appsink drop=true max-buffers=1"
             )
 
-            print("[INFO] Using GStreamer pipeline for optimal RTSP performance")
-            print("[INFO] - Protocol: UDP (lower latency than TCP)")
-            print("[INFO] - Latency: 0ms buffer")
-            print("[INFO] - Frame dropping enabled (prevents buffer buildup)")
+            print("[INFO] Attempting GStreamer pipeline for optimal RTSP performance...")
+            print("[INFO] - Protocol: UDP (protocols=4)")
+            print("[INFO] - Buffer mode: 0 (no buffering)")
+            print("[INFO] - Frame dropping enabled")
 
-            vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+            try:
+                vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                if vs.isOpened():
+                    # Test read to confirm it actually works
+                    test_ret, test_frame = vs.read()
+                    if test_ret and test_frame is not None:
+                        print("[SUCCESS] GStreamer pipeline working!")
+                    else:
+                        print("[WARNING] GStreamer opened but can't read frames")
+                        vs.release()
+                        vs = None
+                else:
+                    vs = None
+            except Exception as e:
+                print(f"[WARNING] GStreamer error: {e}")
+                vs = None
 
             # Fallback to FFMPEG if GStreamer fails
-            if not vs.isOpened():
-                print("[WARNING] GStreamer failed, falling back to FFMPEG with UDP...")
-                # Add RTSP options for FFMPEG to use UDP and reduce latency
+            if vs is None or not vs.isOpened():
+                print("[INFO] Using FFMPEG backend with optimized settings")
+                print("[INFO] - Transport: UDP")
+                print("[INFO] - Flags: nobuffer, low_delay")
+                print("[INFO] - Buffer size: 1 frame")
+
+                # Set FFMPEG options before creating VideoCapture
+                # These options reduce latency and handle packet loss better
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                    "rtsp_transport;udp|"
-                    "fflags;nobuffer|"
-                    "flags;low_delay|"
-                    "framedrop;1|"
-                    "max_delay;0"
+                    "rtsp_transport;udp|"           # Use UDP instead of TCP
+                    "fflags;nobuffer|"              # Don't buffer frames
+                    "flags;low_delay|"              # Minimize delay
+                    "framedrop|"                    # Drop frames if behind
+                    "max_delay;500000|"             # Max delay 500ms
+                    "reorder_queue_size;0|"         # Disable frame reordering (fixes POC errors)
+                    "buffer_size;1024000"           # 1MB buffer (small for low latency)
                 )
+
                 vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
-                vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                # Additional OpenCV settings for low latency
+                vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Keep only 1 frame in buffer
+
+                if vs.isOpened():
+                    print("[SUCCESS] FFMPEG backend initialized successfully")
+                else:
+                    print("[ERROR] FFMPEG backend failed to open stream")
         else:
             print(f"[INFO] Using webcam: {self.CAMERA_SOURCE}")
             vs = cv2.VideoCapture(self.CAMERA_SOURCE)
@@ -610,21 +640,37 @@ class SimpleDrowsinessDetector:
 
                     # Try GStreamer pipeline first
                     gst_pipeline = (
-                        f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=udp ! "
+                        f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=4 buffer-mode=0 ! "
                         "rtph264depay ! h264parse ! avdec_h264 ! "
-                        "videoconvert ! video/x-raw,format=BGR ! appsink drop=1 sync=0"
+                        "videoconvert ! appsink drop=true max-buffers=1"
                     )
-                    vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+
+                    try:
+                        vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                        if not vs.isOpened():
+                            vs = None
+                    except:
+                        vs = None
 
                     # Fallback to FFMPEG if GStreamer fails
-                    if not vs.isOpened():
+                    if vs is None or not vs.isOpened():
                         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                            "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0"
+                            "rtsp_transport;udp|"
+                            "fflags;nobuffer|"
+                            "flags;low_delay|"
+                            "framedrop|"
+                            "max_delay;500000|"
+                            "reorder_queue_size;0|"
+                            "buffer_size;1024000"
                         )
                         vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
                         vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-                    print("[INFO] RTSP stream reconnected")
+                    if vs.isOpened():
+                        print("[INFO] RTSP stream reconnected successfully")
+                    else:
+                        print("[ERROR] Failed to reconnect, retrying...")
+                        time.sleep(1)
                     continue
                 else:
                     break
