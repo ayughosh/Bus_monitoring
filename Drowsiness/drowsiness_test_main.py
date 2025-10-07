@@ -158,7 +158,8 @@ class SimpleDrowsinessDetector:
         (self.nStart, self.nEnd) = face_utils.FACIAL_LANDMARKS_IDXS["nose"]
 
         # --- IMAGE PREPROCESSING FOR BACKLIGHT COMPENSATION ---
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # Reduced clipLimit to avoid over-enhancement and pixelation
+        self.clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
 
     def eye_aspect_ratio(self, eye):
         A = dist.euclidean(eye[1], eye[5])
@@ -248,7 +249,9 @@ class SimpleDrowsinessDetector:
         # Skip bilateral filter in fast mode (calibration)
         if not fast_mode:
             # Apply bilateral filter to reduce noise while preserving edges
-            processed = cv2.bilateralFilter(processed, 5, 50, 50)
+            # Reduced parameters to avoid over-smoothing and pixelation
+            # d=3 (was 5), sigmaColor=30 (was 50), sigmaSpace=30 (was 50)
+            processed = cv2.bilateralFilter(processed, 3, 30, 30)
 
         return processed
 
@@ -519,16 +522,39 @@ class SimpleDrowsinessDetector:
         # Configure VideoCapture for optimal RTSP streaming
         if self.USE_RTSP:
             print(f"[INFO] Connecting to RTSP stream: {self.RTSP_URL}")
-            # Use FFMPEG backend for better RTSP performance
-            vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
 
-            # Optimize for low latency RTSP streaming
-            vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag (1 frame)
-            vs.set(cv2.CAP_PROP_FPS, 30)  # Set to camera's max FPS (30 for Hikvision)
+            # Build RTSP URL with UDP transport and low latency options
+            # UDP is faster than TCP and has lower latency
+            rtsp_url_with_options = self.CAMERA_SOURCE
 
-            # Optional: Set resolution if camera supports it
-            # vs.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            # vs.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            # Use GStreamer pipeline for better RTSP handling (more reliable than FFMPEG for IP cameras)
+            # This pipeline handles network issues, packet loss, and provides smooth playback
+            gst_pipeline = (
+                f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=udp ! "
+                "rtph264depay ! h264parse ! avdec_h264 ! "
+                "videoconvert ! video/x-raw,format=BGR ! appsink drop=1 sync=0"
+            )
+
+            print("[INFO] Using GStreamer pipeline for optimal RTSP performance")
+            print("[INFO] - Protocol: UDP (lower latency than TCP)")
+            print("[INFO] - Latency: 0ms buffer")
+            print("[INFO] - Frame dropping enabled (prevents buffer buildup)")
+
+            vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+
+            # Fallback to FFMPEG if GStreamer fails
+            if not vs.isOpened():
+                print("[WARNING] GStreamer failed, falling back to FFMPEG with UDP...")
+                # Add RTSP options for FFMPEG to use UDP and reduce latency
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "rtsp_transport;udp|"
+                    "fflags;nobuffer|"
+                    "flags;low_delay|"
+                    "framedrop;1|"
+                    "max_delay;0"
+                )
+                vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
+                vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             print(f"[INFO] Using webcam: {self.CAMERA_SOURCE}")
             vs = cv2.VideoCapture(self.CAMERA_SOURCE)
@@ -549,10 +575,9 @@ class SimpleDrowsinessDetector:
         print(f"[INFO] Camera resolution: {int(actual_width)}x{int(actual_height)} @ {actual_fps} FPS")
 
         if self.USE_RTSP:
-            print(f"[INFO] RTSP buffer size: {vs.get(cv2.CAP_PROP_BUFFERSIZE)}")
-            print("[INFO] Low-latency mode enabled for RTSP streaming")
+            print("[INFO] RTSP stream configured for low-latency operation")
 
-        time.sleep(2.0)
+        time.sleep(1.0)  # Reduced from 2.0 for faster startup
 
         # Initial calibration - always reset counters
         self.recalibrate(vs, reset_counters=True)
@@ -576,17 +601,44 @@ class SimpleDrowsinessDetector:
                 self.recalibrate(vs, reset_counters=False)
 
             ret, frame = vs.read()
-            if not ret:
+            if not ret or frame is None:
                 # For RTSP streams, reconnect on failure
                 if self.USE_RTSP:
                     print("[WARNING] RTSP stream read failed. Attempting reconnect...")
                     vs.release()
-                    time.sleep(1)
-                    vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
-                    vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    time.sleep(0.5)  # Short delay before reconnect
+
+                    # Try GStreamer pipeline first
+                    gst_pipeline = (
+                        f"rtspsrc location={self.CAMERA_SOURCE} latency=0 protocols=udp ! "
+                        "rtph264depay ! h264parse ! avdec_h264 ! "
+                        "videoconvert ! video/x-raw,format=BGR ! appsink drop=1 sync=0"
+                    )
+                    vs = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+
+                    # Fallback to FFMPEG if GStreamer fails
+                    if not vs.isOpened():
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                            "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0"
+                        )
+                        vs = cv2.VideoCapture(self.CAMERA_SOURCE, cv2.CAP_FFMPEG)
+                        vs.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                    print("[INFO] RTSP stream reconnected")
                     continue
                 else:
                     break
+
+            # Validate frame integrity (skip corrupted frames from network issues)
+            if frame.size == 0 or frame.shape[0] < 100 or frame.shape[1] < 100:
+                print("[WARNING] Corrupted/invalid frame detected, skipping...")
+                continue
+
+            # Additional validation: check if frame is all black or all white (corruption indicator)
+            frame_mean = np.mean(frame)
+            if frame_mean < 5 or frame_mean > 250:
+                print("[WARNING] Abnormal frame detected (all black/white), skipping...")
+                continue
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -615,9 +667,21 @@ class SimpleDrowsinessDetector:
             # Track if we have a valid face with landmarks this frame
             valid_face_detected = False
 
-            if len(rects) > 0:
+            # Check for multiple faces - reject if more than one detected
+            if len(rects) > 1:
+                status_text = "Multiple Faces Detected"
+                color = (255, 165, 0)  # Orange
+                # Draw rectangles around all detected faces
+                for rect in rects:
+                    (x, y, w, h) = (rect.left(), rect.top(), rect.width(), rect.height())
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+                    cv2.putText(frame, "MULTIPLE FACES", (x, y - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                # Don't process - wait for single person
+                valid_face_detected = False
+            elif len(rects) == 1:
                 self.last_rects = rects  # Cache for next frame
-                largest_rect = max(rects, key=lambda r: r.width() * r.height())
+                largest_rect = rects[0]  # Only one face
                 face_width = largest_rect.width()
 
                 if face_width >= self.MIN_FACE_SIZE and not self.is_calibrating:
