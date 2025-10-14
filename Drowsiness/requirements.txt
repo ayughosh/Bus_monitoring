@@ -1,7 +1,7 @@
+# For NPU acceleration onopencv-python
 opencv-python
-dlib
+mediapipe
 numpy
 scipy
-imutils
 Flask
 Pillow
