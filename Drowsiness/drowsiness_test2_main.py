@@ -73,7 +73,7 @@ class MediaPipeDrowsinessDetector:
         self.MAR_YAWN_MULTIPLIER = 1.5
         self.YAWN_MIN_DURATION = 0.8
         self.YAWN_MAX_DURATION = 6.0
-        self.BLINK_CONSEC_FRAMES = 4
+        self.BLINK_CONSEC_FRAMES = 3
         self.FATIGUE_BLINK_RATE_SECONDS = 90
         self.FATIGUE_LOW_BLINK_THRESHOLD = 2
         self.FATIGUE_HIGH_BLINK_THRESHOLD = 40
@@ -89,9 +89,11 @@ class MediaPipeDrowsinessDetector:
         self.NOISE_REDUCTION_STRENGTH = 0.7
 
         # Nod detection constants
-        self.HEAD_NOD_FRAME_WINDOW = 60
-        self.HEAD_NOD_THRESHOLD_MULTIPLIER = 0.25
-        self.NOD_SMOOTHING_KERNEL = 15
+        self.HEAD_NOD_FRAME_WINDOW = 90
+        self.HEAD_NOD_THRESHOLD_MULTIPLIER = 0.06
+        self.NOD_SMOOTHING_KERNEL = 21
+        self.NOD_COOLDOWN_SECONDS = 3.0  # NEW: Prevent rapid re-triggering
+        self.last_nod_time = None  # NEW: Track last nod time
 
         # Initialize detection state variables
         # (These will be reset by reset_detection_state called from load_config)
@@ -110,6 +112,7 @@ class MediaPipeDrowsinessDetector:
         self.blink_timestamps = deque(maxlen=1000)
         self.blink_analysis_start_time = time.time()
         self.display_blink_rate = 0.0
+        self.raw_ear = 0.25  # Raw EAR before smoothing
         self.fatigue_events = []
         self.current_state = 0
         self.confidence_score = 0.0
@@ -217,14 +220,15 @@ class MediaPipeDrowsinessDetector:
         # Initialize detection variables
         self.reset_detection_state()
 
-    def reset_detection_state(self):
+    def reset_detection_state(self, reset_calibration=True):
         """Reset all detection state variables"""
-        # Calibration values
-        self.calibrated_ear_baseline = 0.25
-        self.calibrated_mar_baseline = 0.35
-        self.calibrated_face_size = 150.0
-        self.ear_std_dev = 0.05
-        self.mar_std_dev = 0.10
+        # Calibration values (only reset if explicitly requested)
+        if reset_calibration:
+            self.calibrated_ear_baseline = 0.25
+            self.calibrated_mar_baseline = 0.35
+            self.calibrated_face_size = 150.0
+            self.ear_std_dev = 0.05
+            self.mar_std_dev = 0.10
 
         # Detection states
         self.eye_closure_start_time = None
@@ -233,11 +237,13 @@ class MediaPipeDrowsinessDetector:
         self.yawn_count = 0
         self.nod_count = 0
         self.is_nodding = False
+        self.last_nod_time = None
         self.blink_counter = 0
         self.blink_frame_counter = 0
         self.blink_timestamps = deque(maxlen=1000)
         self.blink_analysis_start_time = time.time()
         self.display_blink_rate = 0.0
+        self.raw_ear = 0.25  # Raw EAR before smoothing
         self.fatigue_events = []
         self.current_state = 0  # 0: Active, 1: Fatigued, 2: Drowsy
         self.confidence_score = 0.0
@@ -285,8 +291,15 @@ class MediaPipeDrowsinessDetector:
             else:
                 ear = 0.25  # Default value
 
-            # Clamp to reasonable range
-            return np.clip(ear, 0.05, 0.5)
+            # Debug: Print raw EAR calculation (before clipping)
+            if not hasattr(self, '_ear_debug_counter'):
+                self._ear_debug_counter = 0
+            self._ear_debug_counter += 1
+            if self._ear_debug_counter % 50 == 0:
+                print(f"[EAR_CALC] Raw EAR: {ear:.4f}, Vertical: {np.mean(vertical_distances):.4f}, Horizontal: {horizontal_distance:.4f}")
+
+            # Clamp to reasonable range (INCREASED max from 0.5 to 1.0 to accommodate different eye shapes)
+            return np.clip(ear, 0.05, 1.0)
 
         except Exception as e:
             print(f"[WARNING] EAR calculation error: {e}")
@@ -331,42 +344,51 @@ class MediaPipeDrowsinessDetector:
             print(f"[WARNING] MAR calculation error: {e}")
             return 0.35
 
-    def detect_head_nod(self, landmarks):
-        """Detect head nodding using convolution-based smoothing (matching dlib version)"""
+    def detect_head_nod(self, landmarks, ear):
+        """Detect head nodding - downward head movement"""
         try:
-            # Get nose tip position (more stable than single point)
+            # Get nose tip position
             nose_positions = [landmarks[i] for i in FaceLandmarks.NOSE_TIP]
             nose_y = np.mean([p.y for p in nose_positions])
 
+            # Apply stronger smoothing for bus vibrations
+            if self.VIBRATION_COMPENSATION:
+                nose_y = self.motion_stabilizer.stabilize(nose_y)
+
             self.head_positions.append(nose_y)
 
-            if len(self.head_positions) >= self.HEAD_NOD_FRAME_WINDOW:
+            # Need enough frames and confirmed active face
+            if len(self.head_positions) >= self.HEAD_NOD_FRAME_WINDOW and self.face_confirmed_active:
                 positions = np.array(self.head_positions)
 
-                # Apply convolution smoothing with kernel (like dlib version)
+                # Apply heavy smoothing with larger kernel
                 kernel = np.ones(self.NOD_SMOOTHING_KERNEL) / self.NOD_SMOOTHING_KERNEL
                 smoothed = np.convolve(positions, kernel, mode='valid')
 
-                #
-                #
-                if len(smoothed) > 20:
-                    # Calculate nod threshold based on calibrated face size
-                    # The threshold is now a fraction of the frame height for better scaling
-                    nod_threshold = 0.03  # Represents a 3% drop in frame height
+                if len(smoothed) > 30:
+                    # Reduced threshold for better sensitivity (3% instead of 6%)
+                    nod_threshold = 0.03  # 3% downward movement
 
-                    # FIX: Compare the start of the window to the end for a sustained droop
-                    start_avg = np.mean(smoothed[:10])  # Average of first 10 smoothed points
-                    end_avg = np.mean(smoothed[-10:])  # Average of last 10 smoothed points
-                    movement = end_avg - start_avg  # Positive value means head moved down
+                    # Compare recent position to baseline
+                    # Look for downward movement (head dropping forward)
+                    start_avg = np.mean(smoothed[:20])  # Earlier baseline
+                    end_avg = np.mean(smoothed[-20:])   # Recent position
+                    movement = end_avg - start_avg  # Positive = downward
 
+                    # Check cooldown period
+                    current_time = time.time()
+                    if self.last_nod_time and (current_time - self.last_nod_time) < self.NOD_COOLDOWN_SECONDS:
+                        return False
+
+                    # Detect nod: significant downward movement
                     if movement > nod_threshold:
                         if not self.is_nodding:
                             self.is_nodding = True
+                            self.last_nod_time = current_time
+                            print(f"[NOD] ✓ Detected! Movement: {movement:.4f} (threshold: {nod_threshold:.4f}), Count: {self.nod_count + 1}")
                             return True
                     else:
                         self.is_nodding = False
-            #
-            #
 
         except Exception as e:
             print(f"[WARNING] Head nod detection error: {e}")
@@ -399,20 +421,44 @@ class MediaPipeDrowsinessDetector:
 
         return face_landmarks, face_blendshapes, face_transform
 
-    def calculate_metrics(self, landmarks):
+    def calculate_metrics(self, landmarks, blendshapes=None):
         """Calculate drowsiness metrics from MediaPipe landmarks"""
-        # Calculate EAR for both eyes
-        left_ear = self.eye_aspect_ratio_mediapipe(
-            landmarks,
-            FaceLandmarks.LEFT_EYE_UPPER,
-            FaceLandmarks.LEFT_EYE_LOWER
-        )
-        right_ear = self.eye_aspect_ratio_mediapipe(
-            landmarks,
-            FaceLandmarks.RIGHT_EYE_UPPER,
-            FaceLandmarks.RIGHT_EYE_LOWER
-        )
-        ear = (left_ear + right_ear) / 2.0
+        # Use MediaPipe blendshapes for eye blink if available (more reliable!)
+        if blendshapes:
+            # Get blink scores from blendshapes (0.0 = open, 1.0 = closed)
+            left_blink = 0.0
+            right_blink = 0.0
+
+            for idx, shape in enumerate(blendshapes):
+                if shape.category_name == 'eyeBlinkLeft':
+                    left_blink = shape.score
+                elif shape.category_name == 'eyeBlinkRight':
+                    right_blink = shape.score
+
+            # Convert blink score to EAR-like value (invert: 1.0 - score)
+            # Open eyes: blink=0.0 → ear=1.0
+            # Closed eyes: blink=1.0 → ear=0.0
+            ear = 1.0 - ((left_blink + right_blink) / 2.0)
+
+            # Debug blendshape values
+            if not hasattr(self, '_blendshape_debug_counter'):
+                self._blendshape_debug_counter = 0
+            self._blendshape_debug_counter += 1
+            if self._blendshape_debug_counter % 50 == 0:
+                print(f"[BLENDSHAPE] Left Blink: {left_blink:.3f}, Right Blink: {right_blink:.3f}, EAR: {ear:.3f}")
+        else:
+            # Fallback to manual EAR calculation
+            left_ear = self.eye_aspect_ratio_mediapipe(
+                landmarks,
+                FaceLandmarks.LEFT_EYE_UPPER,
+                FaceLandmarks.LEFT_EYE_LOWER
+            )
+            right_ear = self.eye_aspect_ratio_mediapipe(
+                landmarks,
+                FaceLandmarks.RIGHT_EYE_UPPER,
+                FaceLandmarks.RIGHT_EYE_LOWER
+            )
+            ear = (left_ear + right_ear) / 2.0
 
         # Calculate MAR
         mar = self.mouth_aspect_ratio_mediapipe(landmarks)
@@ -423,6 +469,9 @@ class MediaPipeDrowsinessDetector:
 
         smoothed_ear = np.mean(self.ear_history)
         smoothed_mar = np.mean(self.mar_history)
+
+        # Store raw EAR for blink detection (smoothing hides quick blinks)
+        self.raw_ear = ear
 
         return smoothed_ear, smoothed_mar
 
@@ -455,8 +504,8 @@ class MediaPipeDrowsinessDetector:
         }
 
         stable_frames = 0
-        target_frames = 60
-        max_attempts = target_frames * 3
+        target_frames = 45  # Reduced from 60 for faster calibration
+        max_attempts = target_frames * 5  # Increased from 3x to 5x for more attempts
         attempt = 0
 
         while stable_frames < target_frames and attempt < max_attempts:
@@ -475,8 +524,8 @@ class MediaPipeDrowsinessDetector:
             if landmarks:
                 # Face detected successfully
                 try:
-                    # Calculate metrics
-                    ear, mar = self.calculate_metrics(landmarks)
+                    # Calculate metrics with blendshapes
+                    ear, mar = self.calculate_metrics(landmarks, blendshapes)
 
                     # Estimate face size from landmarks
                     face_points = [landmarks[i] for i in FaceLandmarks.FACE_OVAL]
@@ -484,17 +533,56 @@ class MediaPipeDrowsinessDetector:
                     face_height = max([p.y for p in face_points]) - min([p.y for p in face_points])
                     face_size = (face_width + face_height) * frame.shape[0] / 2
 
-                    # Validate values
-                    if 0.15 < ear < 0.45 and 0.2 < mar < 0.6:
+                    frame_height = frame.shape[0]
+                    min_face_size = frame_height * 0.10  # Relaxed from 15% to 10%
+                    max_face_size = frame_height * 0.95  # Relaxed from 90% to 95%
+
+                    face_size_valid = min_face_size < face_size < max_face_size
+
+                    # RELAXED validation for more robust calibration
+                    # EAR: Accept wider range (0.4-1.0 instead of 0.70-1.0)
+                    # MAR: Accept wider range (0.05-0.80 instead of 0.10-0.70)
+                    # This handles different eye shapes, lighting, and face angles better
+                    ear_valid = 0.40 < ear < 1.0
+                    mar_valid = 0.05 < mar < 0.80
+
+                    if ear_valid and mar_valid and face_size_valid:
                         calibration_samples['ear'].append(ear)
                         calibration_samples['mar'].append(mar)
                         calibration_samples['face_size'].append(face_size)
                         stable_frames += 1
 
-                    # Update display
+                        # Debug: Show sample values more frequently
+                        if stable_frames % 5 == 0:  # Every 5 frames instead of 10
+                            print(f"[CALIBRATION] ✓ Sample {stable_frames}/{target_frames}: EAR={ear:.3f}, MAR={mar:.3f}, Face={face_size:.0f}")
+                    else:
+                        # Debug why sample was rejected (but don't spam - only every 10 attempts)
+                        if attempt % 10 == 0:
+                            reasons = []
+                            if not ear_valid:
+                                reasons.append(f"EAR={ear:.3f} out of range [0.40-1.0]")
+                            if not mar_valid:
+                                reasons.append(f"MAR={mar:.3f} out of range [0.05-0.80]")
+                            if not face_size_valid:
+                                reasons.append(f"Face size={face_size:.0f} out of range [{min_face_size:.0f}-{max_face_size:.0f}]")
+                            if reasons:
+                                print(f"[CALIBRATION] Sample rejected: {', '.join(reasons)}")
+
+                    # Update display with better visual feedback
                     progress = int((stable_frames / target_frames) * 100)
-                    cv2.putText(processed, f"CALIBRATING: {progress}%", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    status_text = f"CALIBRATING: {progress}% ({stable_frames}/{target_frames})"
+                    color = (0, 255, 255)  # Yellow
+
+                    # Show if current values are valid
+                    validity = "VALID" if (ear_valid and mar_valid and face_size_valid) else "WAITING..."
+                    validity_color = (0, 255, 0) if validity == "VALID" else (0, 165, 255)  # Green or Orange
+
+                    cv2.putText(processed, status_text, (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    cv2.putText(processed, validity, (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, validity_color, 2)
+                    cv2.putText(processed, f"EAR: {ear:.3f} MAR: {mar:.3f}", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                 except Exception as e:
                     print(f"[WARNING] Calibration sample error: {e}")
@@ -511,17 +599,24 @@ class MediaPipeDrowsinessDetector:
             except:
                 pass
 
-        # Process calibration samples
-        if len(calibration_samples['ear']) >= target_frames * 0.6:
-            # Remove outliers using IQR method
+        # Process calibration samples - LOWERED threshold from 60% to 40%
+        min_samples_needed = int(target_frames * 0.4)  # Need at least 40% of target
+        samples_collected = len(calibration_samples['ear'])
+
+        print(f"\n[CALIBRATION] Collected {samples_collected}/{target_frames} samples (minimum: {min_samples_needed})")
+
+        if samples_collected >= min_samples_needed:
+            # Remove outliers using IQR method (but more gently)
             for key in calibration_samples:
                 values = np.array(calibration_samples[key])
-                q1, q3 = np.percentile(values, [25, 75])
-                iqr = q3 - q1
-                mask = ((values >= q1 - 1.5 * iqr) & (values <= q3 + 1.5 * iqr))
-                calibration_samples[key] = values[mask]
+                if len(values) >= 5:  # Only remove outliers if we have enough samples
+                    q1, q3 = np.percentile(values, [25, 75])
+                    iqr = q3 - q1
+                    # Increased outlier tolerance from 1.5 to 2.0 IQR
+                    mask = ((values >= q1 - 2.0 * iqr) & (values <= q3 + 2.0 * iqr))
+                    calibration_samples[key] = values[mask]
 
-            # Set calibrated values
+            # Set calibrated values using median (robust to outliers)
             self.calibrated_ear_baseline = np.median(calibration_samples['ear'])
             self.ear_std_dev = np.std(calibration_samples['ear'])
 
@@ -530,22 +625,52 @@ class MediaPipeDrowsinessDetector:
 
             self.calibrated_face_size = np.median(calibration_samples['face_size'])
 
-            print(f"\n[SUCCESS] Calibration complete!")
-            print(f"  EAR baseline: {self.calibrated_ear_baseline:.3f} (±{self.ear_std_dev:.3f})")
-            print(f"  MAR baseline: {self.calibrated_mar_baseline:.3f} (±{self.mar_std_dev:.3f})")
+            # Calculate thresholds
+            ear_threshold = self.calibrated_ear_baseline * self.EAR_THRESHOLD_MULTIPLIER
+            mar_threshold = self.calibrated_mar_baseline * self.MAR_YAWN_MULTIPLIER
+
+            print(f"\n{'='*70}")
+            print(f"[SUCCESS] ✓ Calibration complete! ({samples_collected} samples)")
+            print(f"{'='*70}")
+            print(f"  EAR baseline (eyes open): {self.calibrated_ear_baseline:.3f} (±{self.ear_std_dev:.3f})")
+            print(f"  EAR threshold (blink):    {ear_threshold:.3f} (baseline × {self.EAR_THRESHOLD_MULTIPLIER})")
+            print(f"  → Blink detected when EAR drops below {ear_threshold:.3f}")
+            print(f"")
+            print(f"  MAR baseline (mouth closed): {self.calibrated_mar_baseline:.3f} (±{self.mar_std_dev:.3f})")
+            print(f"  MAR threshold (yawn):        {mar_threshold:.3f} (baseline × {self.MAR_YAWN_MULTIPLIER})")
+            print(f"  → Yawn detected when MAR rises above {mar_threshold:.3f}")
+            print(f"")
             print(f"  Face size: {self.calibrated_face_size:.1f}")
+            print(f"{'='*70}\n")
         else:
-            print(f"\n[WARNING] Insufficient calibration samples. Using defaults.")
+            # Still failed - use defaults but warn clearly
+            print(f"\n{'='*50}")
+            print(f"[WARNING] ⚠ Calibration incomplete!")
+            print(f"{'='*50}")
+            print(f"  Only collected {samples_collected}/{target_frames} samples")
+            print(f"  (minimum needed: {min_samples_needed})")
+            print(f"")
+            print(f"  Using default values:")
+            print(f"  - EAR baseline: {self.calibrated_ear_baseline:.3f}")
+            print(f"  - MAR baseline: {self.calibrated_mar_baseline:.3f}")
+            print(f"")
+            print(f"  TIP: Ensure good lighting and look straight at camera")
+            print(f"       with eyes open and mouth closed")
+            print(f"{'='*50}\n")
 
         # Save recalibration time before reset
         recalibration_time = time.time()
 
         if reset_counters:
-            self.reset_detection_state()
+            # Reset detection state but KEEP calibration values
+            self.reset_detection_state(reset_calibration=False)
             # Restore recalibration time after reset
             self.last_recalibration_time = recalibration_time
         else:
+            # Don't reset detection state, just update recalibration time
             self.last_recalibration_time = recalibration_time
+
+
 
     def run(self):
         """Main detection loop"""
@@ -607,19 +732,26 @@ class MediaPipeDrowsinessDetector:
             landmarks, blendshapes, transform = self.process_frame_with_mediapipe(processed)
 
             if landmarks:
-                # Calculate metrics
-                ear, mar = self.calculate_metrics(landmarks)
+                # Calculate metrics (returns smoothed values) with blendshapes
+                ear, mar = self.calculate_metrics(landmarks, blendshapes)
 
+                # ADD THIS DEBUG OUTPUT
+                if fps_counter % 30 == 0:  # Print every 30 frames
+                    print(
+                        f"[DEBUG] RAW_EAR: {self.raw_ear:.3f}, SMOOTH_EAR: {ear:.3f}, Threshold: {self.calibrated_ear_baseline * self.EAR_THRESHOLD_MULTIPLIER:.3f}, "
+                        f"Blinks: {self.blink_counter}, Confidence: {self.confidence_score:.2f}, BFC: {self.blink_frame_counter}")
                 # Calculate confidence score based on landmark quality
                 self.confidence_score = min(1.0, len(self.ear_history) / 5.0) if self.face_confirmed_active else 0.0
 
-                # Detect drowsiness indicators
-                self.detect_blinks(ear)
+                # Detect drowsiness indicators - USE RAW EAR for blink detection
+                self.detect_blinks(self.raw_ear)
                 self.detect_yawns(mar)
 
-                if self.detect_head_nod(landmarks):
+
+                if self.detect_head_nod(landmarks, ear):
                     self.nod_count += 1
                     self.fatigue_events.append(time.time())
+                    print(f"[FATIGUE] Head nod detected with droopy eyes (EAR: {ear:.3f})")
 
                 # Update state machine
                 self.update_state_machine(ear, mar)
@@ -686,15 +818,37 @@ class MediaPipeDrowsinessDetector:
         return True
 
     def detect_blinks(self, ear):
-        """Detect blinks with vibration compensation"""
+        """Detect blinks with vibration compensation and validation"""
         threshold = self.calibrated_ear_baseline * self.EAR_THRESHOLD_MULTIPLIER
+
+        # TEMPORARY: Print every 25 frames for debugging (slower output)
+        if not hasattr(self, '_debug_frame_counter'):
+            self._debug_frame_counter = 0
+
+        self._debug_frame_counter += 1
+        if self._debug_frame_counter % 25 == 0:
+            print(f"[BLINK_DEBUG] EAR: {ear:.3f}, Threshold: {threshold:.3f}, Below: {ear < threshold}, Counter: {self.blink_frame_counter}, Conf: {self.confidence_score:.2f}")
+
+        # Allow blink detection once confidence is reasonable (not just face_confirmed_active)
+        if self.confidence_score < 0.1:  # Changed from face_confirmed_active check
+            self.blink_frame_counter = 0
+            if self._debug_frame_counter % 30 == 0:  # Print occasionally
+                print(f"[BLINK_DEBUG] Confidence too low: {self.confidence_score:.2f} < 0.1")
+            return
 
         if ear < threshold:
             self.blink_frame_counter += 1
+            print(f"[BLINK_DEBUG] >>> Eye CLOSED - Counter: {self.blink_frame_counter}")
         else:
-            if self.blink_frame_counter >= self.BLINK_CONSEC_FRAMES:
+            # Validate blink: must be brief (not prolonged eye closure)
+            if self.BLINK_CONSEC_FRAMES <= self.blink_frame_counter <= 10:  # Max 10 frames
                 self.blink_counter += 1
                 self.blink_timestamps.append(time.time())
+                print(f"\n{'='*60}\n[BLINK] ✓✓✓ DETECTED! Total: {self.blink_counter}, Frames: {self.blink_frame_counter}, EAR: {ear:.3f} < Thresh: {threshold:.3f}\n{'='*60}\n")
+            elif self.blink_frame_counter > 10:
+                print(f"[DEBUG] Prolonged closure ignored: {self.blink_frame_counter} frames (likely drowsiness, not blink)")
+            elif self.blink_frame_counter > 0:
+                print(f"[DEBUG] Too few frames for blink: {self.blink_frame_counter} < {self.BLINK_CONSEC_FRAMES}")
             self.blink_frame_counter = 0
 
         # Track eye closure duration for drowsiness
@@ -705,63 +859,99 @@ class MediaPipeDrowsinessDetector:
             self.eye_closure_start_time = None
 
     def detect_yawns(self, mar):
-        """Detect yawns with robust state machine"""
+        """Detect yawns with robust state machine - filters out speech by requiring sustained opening"""
         yawn_threshold = self.calibrated_mar_baseline * self.MAR_YAWN_MULTIPLIER
 
         if mar > yawn_threshold:
+            # Mouth is open wide (above threshold)
             if self.yawn_start_time is None:
+                # Start tracking potential yawn
                 self.yawn_start_time = time.time()
                 self.yawn_phase = "opening"
+            else:
+                # Check how long mouth has been open
+                opening_duration = time.time() - self.yawn_start_time
+
+                # Only mark as valid yawn opening if mouth stays open for at least 2.5 seconds
+                # This filters out quick mouth movements during speech
+                if opening_duration >= 2.5:
+                    self.yawn_phase = "sustained_opening"  # Valid yawn in progress
+                else:
+                    self.yawn_phase = "opening"  # Still opening, not yet confirmed
         else:
+            # Mouth closed (below threshold)
             if self.yawn_start_time:
                 yawn_duration = time.time() - self.yawn_start_time
-                if self.YAWN_MIN_DURATION <= yawn_duration <= self.YAWN_MAX_DURATION:
+
+                # Only count as yawn if:
+                # 1. Total duration is within valid range (YAWN_MIN_DURATION to YAWN_MAX_DURATION)
+                # 2. The mouth was open for at least 2.5 seconds (sustained_opening phase reached)
+                if (self.YAWN_MIN_DURATION <= yawn_duration <= self.YAWN_MAX_DURATION
+                    and self.yawn_phase == "sustained_opening"):
                     self.yawn_count += 1
                     self.fatigue_events.append(time.time())
+                    print(f"[YAWN] ✓ Detected! Duration: {yawn_duration:.1f}s, Count: {self.yawn_count}")
                     self.yawn_phase = "closing"
                 else:
+                    # Rejected - either too short, too long, or didn't sustain opening long enough
+                    if yawn_duration < 2.5:
+                        print(f"[YAWN] Rejected - too brief ({yawn_duration:.1f}s < 2.5s, likely speech)")
+                    elif yawn_duration < self.YAWN_MIN_DURATION:
+                        print(f"[YAWN] Rejected - duration {yawn_duration:.1f}s < min {self.YAWN_MIN_DURATION}s")
+                    elif yawn_duration > self.YAWN_MAX_DURATION:
+                        print(f"[YAWN] Rejected - duration {yawn_duration:.1f}s > max {self.YAWN_MAX_DURATION}s")
                     self.yawn_phase = "idle"
-                self.yawn_start_time=None
+
+                self.yawn_start_time = None
             else:
                 self.yawn_phase = "idle"
 
     def update_state_machine(self, ear, mar):
-        """Update drowsiness state machine"""
+        """MODIFIED: Update drowsiness state machine with better logic"""
         current_time = time.time()
 
-        # Calculate display blink rate (blinks per minute over analysis window)
-        # This is different from the 60-second rolling counter
-        if current_time - self.blink_analysis_start_time > self.FATIGUE_BLINK_RATE_SECONDS:
-            # Calculate blinks per minute from the analysis window
-            self.display_blink_rate = (self.blink_counter / self.FATIGUE_BLINK_RATE_SECONDS) * 60
+        # Get the accurate 60-second rolling blink count
+        cutoff_time = current_time - self.FATIGUE_BLINK_RATE_SECONDS
+        recent_blinks = sum(1 for ts in self.blink_timestamps if ts >= cutoff_time)
+        self.display_blink_rate = recent_blinks
 
-            # Check for fatigue based on blink rate
-            if (self.display_blink_rate < self.FATIGUE_LOW_BLINK_THRESHOLD or
-                    self.display_blink_rate > self.FATIGUE_HIGH_BLINK_THRESHOLD):
-                if self.confidence_score > 0.3:
+        # Only check blink rate if enough time has passed AND face is active
+        if (current_time - self.blink_analysis_start_time > self.FATIGUE_BLINK_RATE_SECONDS
+                and self.face_confirmed_active):
+
+            is_fatigued_by_blinks = (recent_blinks < self.FATIGUE_LOW_BLINK_THRESHOLD or
+                                     recent_blinks > self.FATIGUE_HIGH_BLINK_THRESHOLD)
+
+            # More conservative fatigue event addition
+            if is_fatigued_by_blinks and self.confidence_score > 0.5:  # Increased from 0.3
+                # Add fatigue event with longer cooldown
+                if not self.fatigue_events or (current_time - self.fatigue_events[-1] > 10):  # Increased from 5
                     self.fatigue_events.append(current_time)
-
-            # FIX: Reset the analysis window first, THEN reset the counter
-            self.blink_analysis_start_time = current_time
-            self.blink_counter = 0
+                    print(f"[FATIGUE] Abnormal blink rate: {recent_blinks}/60s")
 
         # Clean old fatigue events (5-minute window)
-        self.fatigue_events = [e for e in self.fatigue_events
-                               if current_time - e < 300]
+        self.fatigue_events = [e for e in self.fatigue_events if current_time - e < 300]
 
-        # State transitions
+        # State transitions with hysteresis
         if self.current_state == 0:  # Active
             if len(self.fatigue_events) >= self.FATIGUE_EVENT_THRESHOLD:
-                self.current_state = 1  # Fatigued
+                self.current_state = 1
+                print(f"[STATE] Active → Fatigued ({len(self.fatigue_events)} events)")
+
         elif self.current_state == 1:  # Fatigued
-            if len(self.fatigue_events) >= self.DROWSY_MIN_FATIGUE_EVENTS:
-                if self.yawn_count >= self.DROWSY_MIN_YAWNS:
-                    self.current_state = 2  # Drowsy
-            elif len(self.fatigue_events) < 3:
-                self.current_state = 0  # Active
+            is_drowsy = (len(self.fatigue_events) >= self.DROWSY_MIN_FATIGUE_EVENTS and
+                         self.yawn_count >= self.DROWSY_MIN_YAWNS)
+            if is_drowsy:
+                self.current_state = 2
+                print(f"[STATE] Fatigued → Drowsy ({len(self.fatigue_events)} events, {self.yawn_count} yawns)")
+            elif len(self.fatigue_events) < self.FATIGUE_EVENT_THRESHOLD / 2:
+                self.current_state = 0
+                print(f"[STATE] Fatigued → Active (recovered)")
+
         elif self.current_state == 2:  # Drowsy
-            if len(self.fatigue_events) < 6:
-                self.current_state = 1  # Fatigued
+            if len(self.fatigue_events) < self.DROWSY_MIN_FATIGUE_EVENTS / 2:
+                self.current_state = 1
+                print(f"[STATE] Drowsy → Fatigued (improving)")
 
     def update_face_tracking(self, face_detected):
         """Update face presence tracking"""
@@ -835,7 +1025,7 @@ class MediaPipeDrowsinessDetector:
             "nods": int(self.nod_count),
             "yawn_phase": self.yawn_phase,
             "fatigue_check": int(
-                max(0, self.FATIGUE_BLINK_RATE_SECONDS - (current_time - self.last_recalibration_time)) if self.last_recalibration_time else 0),
+                max(0, self.FATIGUE_BLINK_RATE_SECONDS - (current_time - self.blink_analysis_start_time))),
             "fps": float(fps),
             "ear": float(self.ear_history[-1] if self.ear_history else 0),
             "ear_threshold": float(self.calibrated_ear_baseline * self.EAR_THRESHOLD_MULTIPLIER),
@@ -1318,16 +1508,16 @@ def index():
             'EYE_CLOSURE_SECONDS_THRESHOLD': 'Duration (in seconds) eyes must be closed continuously to trigger drowsiness alert. Lower values = faster alerts.',
             'MAR_YAWN_MULTIPLIER': 'Mouth Aspect Ratio multiplier for yawn detection. How much mouth must open relative to baseline. Lower = more sensitive.',
             'YAWN_MIN_DURATION': 'Minimum duration (seconds) for valid yawn. Too low may trigger false positives. Typical yawn: 0.8-3 seconds.',
-            'BLINK_CONSEC_FRAMES': 'Number of consecutive frames with closed eyes to count as blink. Higher = filters fast eye movements.',
-            'FATIGUE_LOW_BLINK_THRESHOLD': 'Minimum blinks (per 60s) to avoid fatigue. Below this triggers low blink fatigue event.',
-            'FATIGUE_HIGH_BLINK_THRESHOLD': 'Maximum blinks (per 60s) before excessive. Above this triggers high blink fatigue event.',
+            'BLINK_CONSEC_FRAMES': 'Number of consecutive frames with closed eyes to count as blink. Typical: 2-5 frames. Higher = filters fast eye movements, but may miss quick blinks.',
+            'FATIGUE_BLINK_RATE_SECONDS': 'Time window (seconds) for blink rate analysis and "Check In" countdown. Blink rate is calculated over this period. 60-120 recommended.',
+            'FATIGUE_LOW_BLINK_THRESHOLD': 'Minimum blinks within the check time window to avoid fatigue. Below this triggers low blink fatigue event.',
+            'FATIGUE_HIGH_BLINK_THRESHOLD': 'Maximum blinks within the check time window before excessive. Above this triggers high blink fatigue event.',
             'DROWSY_MIN_YAWNS': 'Number of yawns in recent history to trigger drowsy state. Lower = more sensitive to yawning.',
             'MIN_CONFIDENCE': 'Minimum confidence score for detection. Higher = fewer false positives, but may miss genuine events.',
             'FATIGUE_EVENT_THRESHOLD': 'Number of recent fatigue events needed to transition to FATIGUE state. Lower = faster alerts.',
             'DROWSY_MIN_FATIGUE_EVENTS': 'Number of fatigue events required to escalate from FATIGUE to DROWSY state. Lower = escalates faster.',
             'AUTO_RECALIBRATE_SECONDS': 'Interval (seconds) between automatic recalibrations. Helps adapt to lighting changes. 30-300 recommended.',
             'FACE_LOST_RECALIBRATE_SECONDS': 'Duration (seconds) face must be lost before triggering recalibration when it returns. Useful for detecting person changes. 0.5-10 recommended.',
-            'FATIGUE_BLINK_RATE_SECONDS': 'Time window (seconds) for blink rate analysis and "Check In" countdown. Blink rate is calculated over this period. 30-120 recommended.',
             'FACE_ACTIVE_THRESHOLD_SECONDS': 'Time (seconds) face must be continuously present before being considered "active". Prevents false detections from people walking by. 1-5 recommended.'
         };
 
@@ -1571,6 +1761,14 @@ def index():
                             <button class="arrow-btn" onclick="adjustValue('FACE_ACTIVE_THRESHOLD_SECONDS', 1)">▶</button>
                         </div>
                     </div>
+                    <div class="config-input">
+                        <label>Fatigue Check Time (s):</label>
+                        <div class="input-with-arrows">
+                            <button class="arrow-btn" onclick="adjustValue('FATIGUE_BLINK_RATE_SECONDS', -1)">◀</button>
+                            <input type="number" id="FATIGUE_BLINK_RATE_SECONDS" step="10" min="30">
+                            <button class="arrow-btn" onclick="adjustValue('FATIGUE_BLINK_RATE_SECONDS', 1)">▶</button>
+                        </div>
+                    </div>
                     <button class="save-btn" onclick="saveConfig()">💾 Save Configuration</button>
                 </div>
             </div>
@@ -1617,6 +1815,7 @@ def get_config():
             "MAR_YAWN_MULTIPLIER": detector_instance.MAR_YAWN_MULTIPLIER,
             "YAWN_MIN_DURATION": detector_instance.YAWN_MIN_DURATION,
             "BLINK_CONSEC_FRAMES": detector_instance.BLINK_CONSEC_FRAMES,
+            "FATIGUE_BLINK_RATE_SECONDS": detector_instance.FATIGUE_BLINK_RATE_SECONDS,
             "FATIGUE_LOW_BLINK_THRESHOLD": detector_instance.FATIGUE_LOW_BLINK_THRESHOLD,
             "FATIGUE_HIGH_BLINK_THRESHOLD": detector_instance.FATIGUE_HIGH_BLINK_THRESHOLD,
             "DROWSY_MIN_YAWNS": detector_instance.DROWSY_MIN_YAWNS,
